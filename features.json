@@ -1,0 +1,71 @@
+{
+  "appName": "MemoryMate",
+  "description": "An intelligent health and appointment management application designed to help users track medical documents, appointments, and medications with AI-powered insights.",
+  "features": [
+    {
+      "id": "multi_profile_security",
+      "name": "Multi-Profile Security & Data Isolation",
+      "description": "Secure user authentication using Clerk, supporting a primary Account Owner who can manage multiple Sub-Profiles (e.g., family members). Strict backend middleware ensures complete data isolation between profiles."
+    },
+    {
+      "id": "document_vault",
+      "name": "Document Vault",
+      "description": "A secure storage area for users to upload, view, and manage medical letters, images, and other important documents."
+    },
+    {
+      "id": "ai_document_analysis",
+      "name": "AI Document Analysis & OCR",
+      "description": "Automatically analyzes uploaded documents using Gemini AI to extract key details such as appointment dates, times, locations, contact information, and medical diagnoses."
+    },
+    {
+      "id": "nhs_health_insights",
+      "name": "NHS Health Insights",
+      "description": "Proactively identifies health conditions from uploaded documents and provides empathetic, clinical summaries grounded in NHS guidelines, including self-care tips."
+    },
+    {
+      "id": "reminders_appointments",
+      "name": "Reminders & Appointments",
+      "description": "Allows users to add, view, and manage upcoming medical appointments and general health reminders with recurrence options."
+    },
+    {
+      "id": "medication_tracking",
+      "name": "Medication Tracking",
+      "description": "A dedicated module to log and manage current medications, including strength, directions, images, and last issued dates."
+    },
+    {
+      "id": "support_cards",
+      "name": "Support Cards",
+      "description": "Personalized support cards linking to official NHS resources and relevant charities based on the user's identified health conditions."
+    },
+    {
+      "id": "activity_logs_restore",
+      "name": "Activity Logs & Data Recovery",
+      "description": "A chronological audit log of user actions (ADD, UPDATE, DELETE). Includes a 'Restore' feature to undelete accidentally removed items like reminders, medicines, or documents."
+    },
+    {
+      "id": "ai_chat_vision",
+      "name": "AI Chat & Vision Assistant",
+      "description": "Interactive AI chat and vision capabilities to help users understand their health data or analyze visual medical information."
+    },
+    {
+      "id": "push_tts_alerts",
+      "name": "Push Notifications & Audio Alerts",
+      "description": "Real-time browser push notifications and Text-to-Speech (TTS) audio alerts for upcoming reminders and appointments."
+    },
+    {
+      "id": "admin_backup_restore",
+      "name": "Admin Backup & Restore",
+      "description": "System-level endpoints for administrators to backup the entire SQLite database and restore it if necessary."
+    },
+    {
+      "id": "dark_mode",
+      "name": "Dark Mode & Theming",
+      "description": "Built-in support for light and dark themes to improve accessibility and user comfort."
+    },
+    {
+      "id": "caregiver_circle",
+      "name": "Caregiver Circle & Automated SMS Alerts",
+      "description": "Allows users to add caregivers to their profile. When the AI detects critical medical information (e.g., new diagnosis, urgent appointment) in uploaded documents or images, it automatically triggers an SMS alert to all active caregivers via The SMS Works API."
+    }
+  ]
+}

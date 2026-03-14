@@ -1,0 +1,7 @@
+{
+  "name": "MemoryMate",
+  "description": "A compassionate, AI-powered assistant for memory support, featuring reminders, visual analysis, and trusted health information grounded in NHS and dementia charity guidelines.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
