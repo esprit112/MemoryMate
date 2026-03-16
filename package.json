@@ -13,6 +13,8 @@
     "@clerk/express": "^2.0.2",
     "@clerk/react": "^6.0.1",
     "@google/genai": "^1.44.0",
+    "@libsql/client": "^0.17.0",
+    "@vercel/speed-insights": "^2.0.0",
     "axios": "^1.13.6",
     "chokidar": "^5.0.0",
     "cors": "^2.8.5",

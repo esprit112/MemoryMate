@@ -30,6 +30,7 @@ import { generateSpeech, analyzeDocument } from './services/geminiService';
 import { generateId } from './utils/helpers';
 import { playAudio } from './utils/audioUtils';
 import { motion, AnimatePresence } from 'motion/react';
+import { SpeedInsights } from "@vercel/speed-insights/react";
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
@@ -574,6 +575,7 @@ const App: React.FC = () => {
           </div>
         )}
       </Show>
+      <SpeedInsights />
     </div>
   );
 };
