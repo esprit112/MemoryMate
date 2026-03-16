@@ -43,10 +43,10 @@ const CaregiverCircle: React.FC<CaregiverCircleProps> = ({ user }) => {
     try {
       setIsLoading(true);
       const config = await getAuthHeaders();
-      const response = await axios.get(`${getApiUrl()}/caregivers`, config);
+      const response = await axios.get(`${getApiUrl()}/caregivers/${user.id}`, config);
       setCaregivers(response.data);
     } catch (error) {
-      console.error('Failed to fetch caregivers:', error);
+      console.error(error);
       showToast('Failed to load caregivers', 'error');
     } finally {
       setIsLoading(false);
@@ -81,22 +81,24 @@ const CaregiverCircle: React.FC<CaregiverCircleProps> = ({ user }) => {
       const config = await getAuthHeaders();
       const newCaregiver = {
         id: crypto.randomUUID(),
-        user_id: user.id,
+        userId: user.id,
         name,
-        phone_number: phoneNumber,
+        phoneNumber: phoneNumber,
         relationship,
-        alerts_enabled: true
+        alertsEnabled: true
       };
 
-      await axios.post(`${getApiUrl()}/caregivers`, newCaregiver, config);
+      const response = await axios.post(`${getApiUrl()}/caregivers`, newCaregiver, config);
       
-      showToast('Caregiver added successfully', 'success');
-      setName('');
-      setPhoneNumber('');
-      setRelationship('Daughter');
-      fetchCaregivers();
+      if (response.status === 200) {
+        showToast('Caregiver added successfully', 'success');
+        setName('');
+        setPhoneNumber('');
+        setRelationship('Daughter');
+        fetchCaregivers();
+      }
     } catch (error) {
-      console.error('Failed to add caregiver:', error);
+      console.error(error);
       showToast('Failed to add caregiver', 'error');
     } finally {
       setIsAdding(false);
@@ -106,15 +108,15 @@ const CaregiverCircle: React.FC<CaregiverCircleProps> = ({ user }) => {
   const toggleAlerts = async (caregiver: Caregiver) => {
     try {
       const config = await getAuthHeaders();
-      const updated = { ...caregiver, alerts_enabled: !caregiver.alerts_enabled };
+      const updated = { ...caregiver, alertsEnabled: !caregiver.alertsEnabled };
       
       // Optimistic update
       setCaregivers(prev => prev.map(c => c.id === caregiver.id ? updated : c));
       
       await axios.put(`${getApiUrl()}/caregivers/${caregiver.id}`, updated, config);
-      showToast(`Alerts ${updated.alerts_enabled ? 'enabled' : 'disabled'} for ${caregiver.name}`, 'success');
+      showToast(`Alerts ${updated.alertsEnabled ? 'enabled' : 'disabled'} for ${caregiver.name}`, 'success');
     } catch (error) {
-      console.error('Failed to update caregiver:', error);
+      console.error(error);
       showToast('Failed to update alert settings', 'error');
       fetchCaregivers(); // Revert on failure
     }
@@ -129,7 +131,7 @@ const CaregiverCircle: React.FC<CaregiverCircleProps> = ({ user }) => {
       setCaregivers(prev => prev.filter(c => c.id !== id));
       showToast('Caregiver removed', 'success');
     } catch (error) {
-      console.error('Failed to delete caregiver:', error);
+      console.error(error);
       showToast('Failed to remove caregiver', 'error');
     } finally {
       setCaregiverToDelete(null);
@@ -152,10 +154,10 @@ const CaregiverCircle: React.FC<CaregiverCircleProps> = ({ user }) => {
       <AnimatePresence>
         {toast && (
           <motion.div
-            initial={{ opacity: 0, y: -20 }}
+            initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -20 }}
-            className={`fixed top-4 right-4 z-50 p-4 rounded-xl shadow-lg flex items-center gap-3 text-white ${
+            exit={{ opacity: 0, y: 20 }}
+            className={`fixed bottom-4 right-4 z-[9999] p-4 rounded-xl shadow-lg flex items-center gap-3 text-white ${
               toast.type === 'success' ? 'bg-emerald-500' : 'bg-red-500'
             }`}
           >
@@ -257,7 +259,7 @@ const CaregiverCircle: React.FC<CaregiverCircleProps> = ({ user }) => {
                   </div>
                   <div className="flex items-center gap-2 text-slate-600 dark:text-slate-300 text-sm mb-4">
                     <Phone className="w-4 h-4" />
-                    {caregiver.phone_number}
+                    {caregiver.phoneNumber}
                   </div>
                 </div>
                 
@@ -265,13 +267,13 @@ const CaregiverCircle: React.FC<CaregiverCircleProps> = ({ user }) => {
                   <button
                     onClick={() => toggleAlerts(caregiver)}
                     className={`flex items-center gap-2 text-sm font-medium px-3 py-1.5 rounded-lg transition-colors ${
-                      caregiver.alerts_enabled 
+                      caregiver.alertsEnabled 
                         ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400' 
                         : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400'
                     }`}
                   >
-                    {caregiver.alerts_enabled ? <Bell className="w-4 h-4" /> : <BellOff className="w-4 h-4" />}
-                    {caregiver.alerts_enabled ? 'Alerts On' : 'Alerts Off'}
+                    {caregiver.alertsEnabled ? <Bell className="w-4 h-4" /> : <BellOff className="w-4 h-4" />}
+                    {caregiver.alertsEnabled ? 'Alerts On' : 'Alerts Off'}
                   </button>
                   
                   <button
@@ -295,7 +297,7 @@ const CaregiverCircle: React.FC<CaregiverCircleProps> = ({ user }) => {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[9999] flex items-center justify-center p-4"
           >
             <motion.div
               initial={{ opacity: 0, scale: 0.95 }}

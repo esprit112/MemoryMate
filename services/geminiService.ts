@@ -327,7 +327,7 @@ Tone: Ensure the description is clinical and precise. Avoid conversational fluff
   }
 };
 
-export const analyzeImage = async (base64Image: string, prompt: string, mimeType: string = 'image/jpeg'): Promise<{ text: string, supportCardSuggestion?: SupportCardSuggestion }> => {
+export const analyzeImage = async (userId: string, base64Image: string, prompt: string, mimeType: string = 'image/jpeg'): Promise<{ text: string, supportCardSuggestion?: SupportCardSuggestion }> => {
   try {
     const ai = getAI();
     const modelId = 'gemini-3.1-flash-lite-preview';
@@ -402,8 +402,8 @@ Do not include this second JSON block if the information is not critical.`,
         const alertData = JSON.parse(alertJsonMatch[1]);
         text = text.replace(alertJsonMatch[0], '').trim();
         
-        if (alertData.is_critical && alertData.sms_summary) {
-          api.triggerCaregiverAlert(alertData.sms_summary).catch(e => 
+        if (alertData.is_critical && alertData.sms_summary && context?.profile.id) {
+          api.triggerCaregiverAlert(context.profile.id, alertData.sms_summary).catch(e => 
             console.error("Failed to trigger caregiver alert silently", e)
           );
         }
@@ -487,119 +487,18 @@ export interface DocumentAnalysisResult {
   supportCardSuggestion?: SupportCardSuggestion;
   is_critical?: boolean;
   sms_summary?: string;
+  smsResults?: { success: boolean; caregiverName: string; error?: string }[];
 }
 
-export const analyzeDocument = async (base64Data: string, mimeType: string): Promise<DocumentAnalysisResult> => {
+export const analyzeDocument = async (userId: string, base64Data: string, mimeType: string): Promise<DocumentAnalysisResult> => {
   try {
-    const ai = getAI();
-    const modelId = 'gemini-3.1-flash-lite-preview';
-    
-    const response = await ai.models.generateContent({
-      model: modelId,
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: mimeType,
-              data: base64Data
-            }
-          },
-          { text: "Analyze this document. Extract as much detail as possible to fill a contact/appointment form. If a health condition, illness, disorder, or medical term is identified, proactively provide a 'Health Insights' section. This section must be strictly grounded in NHS (National Health Service) guidelines. Provide a concise summary of the condition, typical next steps, and official NHS recommendations. Include a direct prompt for the user to confirm their appointment details. Tone: Empathetic, clinical, and authoritative. Constraint: Always include a disclaimer that this information is for educational purposes and is not a substitute for professional medical advice.\n\nDYNAMIC RESOURCE CURATOR PROTOCOL:\nMonitor inputs for signs of a specific medical diagnosis or condition (e.g., Epilepsy, Diabetes, Asthma).\nIf a condition is identified via medication names or clinical text, you MUST populate the 'supportCardSuggestion' field with the condition details to ask the user if they would like to add a 'Trusted Support Card' to their Help & Info section.\n\nCAREGIVER ALERT PROTOCOL:\nDetermine if the document contains critical information (e.g., new diagnosis, urgent appointment, medication change, or concerning test results). If so, set 'is_critical' to true and provide a brief, professional 'sms_summary' (max 160 chars) suitable for sending to a caregiver." }
-        ]
-      },
-      config: {
-        tools: [{ googleSearch: {} }],
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            summary: { 
-              type: Type.STRING, 
-              description: "A simple summary of the document." 
-            },
-            category: {
-              type: Type.STRING,
-              description: "Type of document. MUST be one of: Medical, Appointment, Identification, Medicine, General, Household, Vehicle."
-            },
-            organization: {
-              type: Type.STRING,
-              description: "Name of the hospital, clinic, or organization (e.g. NHS, St Mary's Hospital)"
-            },
-            department: {
-              type: Type.STRING,
-              description: "Specific department (e.g. Cardiology, Radiology)"
-            },
-            contactName: {
-              type: Type.STRING,
-              description: "Name of a specific contact person mentioned"
-            },
-            contactPhone: {
-              type: Type.STRING,
-              description: "Phone number found in the document"
-            },
-            contactEmail: {
-              type: Type.STRING,
-              description: "Email address found in the document"
-            },
-            isAppointment: { 
-              type: Type.BOOLEAN, 
-              description: "True if the document contains a future appointment." 
-            },
-            appointmentDate: { 
-              type: Type.STRING, 
-              description: "Date in YYYY-MM-DD format." 
-            },
-            appointmentTime: { 
-              type: Type.STRING, 
-              description: "Time in HH:MM format (24h)." 
-            },
-            location: {
-              type: Type.STRING,
-              description: "Full address or location of the appointment/service."
-            },
-            healthInsights: {
-              type: Type.STRING,
-              description: "If a health condition is identified, provide a professional, supportive summary grounded in NHS guidelines. Include a brief overview, commonly recommended NHS pathways/self-care tips, a prompt to confirm appointment details, and a mandatory disclaimer that it is for educational purposes."
-            },
-            supportCardSuggestion: {
-              type: Type.OBJECT,
-              description: "A suggestion to add a Trusted Support Card to the user's Help & Info section if a condition is detected.",
-              properties: {
-                detected_condition: { type: Type.STRING, description: "The medical condition (e.g., Epilepsy)." },
-                suggest_card: { type: Type.BOOLEAN, description: "Must be true." },
-                nhs_url: { type: Type.STRING, description: "The official NHS URL for the condition." },
-                charity_url: { type: Type.STRING, description: "A leading UK-based organization for that condition." },
-                message: { type: Type.STRING, description: "A message confirming the card is being added." },
-                category: { type: Type.STRING, description: "Which 'Trusted Health Information' category it belongs to (e.g., 'Understanding Epilepsy')." }
-              },
-              required: ["detected_condition", "suggest_card", "nhs_url", "charity_url", "message", "category"]
-            },
-            is_critical: {
-              type: Type.BOOLEAN,
-              description: "True if the document contains critical or urgent medical information."
-            },
-            sms_summary: {
-              type: Type.STRING,
-              description: "A short summary (max 160 chars) of the critical information for a caregiver SMS alert."
-            }
-          },
-          required: ["summary", "category", "isAppointment"],
-        }
-      }
+    const res = await fetch(`${api.getApiBase()}/analyze-document`, {
+      method: 'POST',
+      headers: await api.getHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ userId, base64Data, mimeType })
     });
-
-    const result = JSON.parse(response.text || '{}');
-    
-    // Trigger Caregiver Alert if critical
-    if (result.is_critical && result.sms_summary) {
-      try {
-        await api.triggerCaregiverAlert(result.sms_summary);
-      } catch (e) {
-        console.error("Failed to trigger caregiver alert silently", e);
-      }
-    }
-
-    return result as DocumentAnalysisResult;
+    if (!res.ok) throw new Error('Failed to analyze document');
+    return res.json();
   } catch (error) {
     console.error("Document Analysis Error:", error);
     throw error;

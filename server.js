@@ -4,6 +4,10 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
 import express from 'express';
+import dns from 'node:dns';
+import { GoogleGenAI, Type } from '@google/genai';
+
+dns.setDefaultResultOrder('ipv4first');
 
 // Load .env file manually if it exists (for compatibility with older Node versions)
 if (fs.existsSync('.env')) {
@@ -60,10 +64,39 @@ const USERS_BASE_DIR = process.env.USERS_BASE_DIR || (PERSISTENT_ROOT === '/data
 // Task 1: Refactor Middleware
 app.use(cors());
 app.use(express.json({ limit: '100mb' })); 
-app.use(clerkMiddleware({
+const clerkHandler = clerkMiddleware({
   publishableKey: process.env.CLERK_PUBLISHABLE_KEY || process.env.VITE_CLERK_PUBLISHABLE_KEY,
   secretKey: process.env.CLERK_SECRET_KEY
-}));
+});
+
+app.use(async (req, res, next) => {
+  try {
+    await clerkHandler(req, res, (err) => {
+      if (err) {
+        const errorString = err ? err.toString() : '';
+        if (errorString.includes('fetch failed') || errorString.includes('EAI_AGAIN')) {
+          console.error("Clerk Handshake Error (via next):", errorString);
+          return res.status(503).json({
+            error: "DNS_TIMEOUT",
+            message: "MemoryMate cannot reach authentication servers. Please check your internet connection."
+          });
+        }
+        return next(err);
+      }
+      next();
+    });
+  } catch (error) {
+    const errorString = error ? error.toString() : '';
+    if (errorString.includes('fetch failed') || errorString.includes('EAI_AGAIN')) {
+      console.error("Clerk Handshake Error (via throw):", errorString);
+      return res.status(503).json({
+        error: "DNS_TIMEOUT",
+        message: "MemoryMate cannot reach authentication servers. Please check your internet connection."
+      });
+    }
+    next(error);
+  }
+});
 
 // requireAuth helper
 const requireAuth = () => (req, res, next) => {
@@ -138,7 +171,7 @@ function ensureUserDirectories() {
           });
         }
       } catch (err) {
-        console.error(`Failed to ensure directories for ${user.name}:`);
+        console.error(`Failed to ensure directories for ${user.name}:`, err);
       }
     });
   });
@@ -233,12 +266,26 @@ function createTables() {
     // Caregivers Table
     db.run(`CREATE TABLE IF NOT EXISTS caregivers (
       id TEXT PRIMARY KEY,
-      user_id TEXT,
+      userId TEXT,
       name TEXT,
-      phone_number TEXT,
       relationship TEXT,
-      alerts_enabled INTEGER DEFAULT 1,
-      FOREIGN KEY(user_id) REFERENCES users(clerkUserId)
+      phoneNumber TEXT,
+      alertsEnabled INTEGER
+    )`);
+    // Migrate old columns if they exist
+    db.run("ALTER TABLE caregivers RENAME COLUMN user_id TO userId", () => {});
+    db.run("ALTER TABLE caregivers RENAME COLUMN phone_number TO phoneNumber", () => {});
+    db.run("ALTER TABLE caregivers RENAME COLUMN alerts_enabled TO alertsEnabled", () => {});
+
+    // Activity Logs Table
+    db.run(`CREATE TABLE IF NOT EXISTS activity_logs (
+      id TEXT PRIMARY KEY,
+      profileId TEXT,
+      eventType TEXT,
+      message TEXT,
+      status TEXT,
+      technicalDetails TEXT,
+      timestamp DATETIME
     )`);
 
     // Documents Table
@@ -262,10 +309,12 @@ function createTables() {
       location TEXT,
       status TEXT DEFAULT 'active',
       filePath TEXT,
+      file_blob BLOB,
       FOREIGN KEY(userId) REFERENCES users(id)
     )`);
     db.run("ALTER TABLE documents ADD COLUMN status TEXT DEFAULT 'active'", () => {});
     db.run("ALTER TABLE documents ADD COLUMN filePath TEXT", () => {});
+    db.run("ALTER TABLE documents ADD COLUMN file_blob BLOB", () => {});
     const docColumns = [
       { name: 'category', type: 'TEXT' },
       { name: 'organization', type: 'TEXT' },
@@ -280,6 +329,9 @@ function createTables() {
     docColumns.forEach(col => {
       db.run(`ALTER TABLE documents ADD COLUMN ${col.name} ${col.type}`, () => {});
     });
+    
+    // Add unique constraint for duplicate filename prevention
+    db.run("CREATE UNIQUE INDEX IF NOT EXISTS unique_profile_file ON documents(userId, name)", () => {});
 
     // Support Cards Table
     db.run(`CREATE TABLE IF NOT EXISTS support_cards (
@@ -355,7 +407,7 @@ watcher.on('add', async (filePath) => {
         const sql = `INSERT INTO documents (id, userId, name, type, mimeType, data, createdAt, status, filePath) VALUES (?,?,?,?,?,?,?,?,?)`;
         db.run(sql, [docId, user.id, fileName, type, mimeType, fileData, new Date().toISOString(), 'pending_analysis', filePath]);
       } catch (err) {
-        console.error("Failed to read file for auto-processing:");
+        console.error("Failed to read file for auto-processing:", err);
       }
     });
   }
@@ -541,6 +593,7 @@ app.post('/api/restore-item', requireAuth(), (req, res) => {
       try {
         itemData = JSON.parse(log.deleted_data);
       } catch (e) {
+        console.error("Failed to parse deleted data", e);
         return res.status(500).json({ error: "Failed to parse deleted data" });
       }
 
@@ -698,7 +751,7 @@ app.post('/api/users', requireAuth(), (req, res) => {
         });
       }
     } catch (err) {
-      console.error("Failed to create user directories:");
+      console.error("Failed to create user directories:", err);
     }
 
     res.json(u);
@@ -849,25 +902,46 @@ app.delete('/api/reminders/:id', requireAuth(), (req, res) => {
 
 // Document/Medicine Endpoints
 app.get('/api/documents/:userId', requireAuth(), checkProfileOwnership, (req, res) => {
-  db.all("SELECT * FROM documents WHERE userId = ? ORDER BY createdAt DESC", [req.params.userId], (err, rows) => res.json(rows));
+  db.all("SELECT * FROM documents WHERE userId = ? ORDER BY createdAt DESC", [req.params.userId], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    const formattedRows = rows.map(row => {
+      if (row.file_blob) {
+        row.file_blob = Buffer.from(row.file_blob).toString('base64');
+      }
+      return row;
+    });
+    res.json(formattedRows);
+  });
 });
 app.post('/api/documents', requireAuth(), checkProfileOwnership, (req, res) => {
+  console.log(`--- Incoming Request: [${req.method}] [${req.url}] ---`);
   const d = req.body;
-  const sql = `INSERT INTO documents (
-    id, userId, name, type, mimeType, data, summary, createdAt,
-    category, organization, department, contactName, contactPhone, 
-    contactEmail, appointmentDate, appointmentTime, location
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
   
-  const params = [
-    d.id, d.userId, d.name, d.type, d.mimeType, d.data, d.summary || null, d.createdAt,
-    d.category || null, d.organization || null, d.department || null, d.contactName || null,
-    d.contactPhone || null, d.contactEmail || null, d.appointmentDate || null, 
-    d.appointmentTime || null, d.location || null
-  ];
+  // Check for duplicate filename
+  db.get("SELECT id FROM documents WHERE userId = ? AND name = ?", [d.userId, d.name], (err, existingDoc) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (existingDoc) {
+      return res.status(409).json({ error: `A file named '${d.name}' already exists. Please rename the new file to continue.` });
+    }
 
-  db.run(sql, params, () => {
-    res.json(d);
+    const fileBlob = d.data ? Buffer.from(d.data, 'base64') : null;
+    const sql = `INSERT INTO documents (
+      id, userId, name, type, mimeType, data, summary, createdAt,
+      category, organization, department, contactName, contactPhone, 
+      contactEmail, appointmentDate, appointmentTime, location, file_blob
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
+    
+    const params = [
+      d.id, d.userId, d.name, d.type, d.mimeType, d.data, d.summary || null, d.createdAt,
+      d.category || null, d.organization || null, d.department || null, d.contactName || null,
+      d.contactPhone || null, d.contactEmail || null, d.appointmentDate || null, 
+      d.appointmentTime || null, d.location || null, fileBlob
+    ];
+
+    db.run(sql, params, (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(d);
+    });
   });
 });
 app.put('/api/documents/:id', requireAuth(), (req, res) => {
@@ -941,7 +1015,7 @@ app.delete('/api/documents/:id', requireAuth(), (req, res) => {
           fs.unlinkSync(row.filePath);
           console.log(`Deleted physical file: ${path.basename(row.filePath)}`);
         } catch (err) {
-          console.error("Failed to delete physical file:");
+          console.error("Failed to delete physical file:", err);
         }
       }
       db.run("DELETE FROM documents WHERE id = ?", [docId], () => res.json({ success: true }));
@@ -953,10 +1027,11 @@ app.get('/api/medicines/:userId', requireAuth(), checkProfileOwnership, (req, re
     const medicines = rows.map(row => {
       let images = [];
       if (row.image) {
-        if (row.image.trim().startsWith('[')) { try { images = JSON.parse(row.image); } catch (err) { images = [row.image]; } } 
+        if (row.image.trim().startsWith('[')) { try { images = JSON.parse(row.image); } catch (e) { console.error(e); images = [row.image]; } } 
         else { images = [row.image]; }
       }
-      const { image: _image, ...rest } = row;
+      const { image, ...rest } = row;
+      console.log(image ? "Image parsed" : "No image");
       return { ...rest, images };
     });
     res.json(medicines);
@@ -988,12 +1063,27 @@ app.delete('/api/medicines/:id', requireAuth(), (req, res) => {
   });
 });
 
+// Activity Logging Helper
+const logActivity = (profileId, eventType, message, status, technicalDetails) => {
+  const id = Math.random().toString(36).substring(2, 15);
+  const timestamp = new Date().toISOString();
+  db.run(
+    "INSERT INTO activity_logs (id, profileId, eventType, message, status, technicalDetails, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [id, profileId, eventType, message, status, technicalDetails, timestamp],
+    (err) => {
+      if (err) console.error("Failed to log activity:", err);
+    }
+  );
+};
+
 // Caregiver Alerts
-const sendCaregiverSMS = async (phoneNumber, message) => {
+const sendCaregiverSMS = async (phoneNumber, message, profileId, caregiverName) => {
   const jwt = process.env.SMS_WORKS_JWT;
   if (!jwt) {
-    console.warn("SMS_WORKS_JWT not configured. Skipping SMS.");
-    return false;
+    const msg = "SMS_WORKS_JWT not configured. Skipping SMS.";
+    console.warn(msg);
+    logActivity(profileId, 'SMS_DISPATCH', `Failed to send SMS to ${caregiverName}`, 'ERROR', msg);
+    return { success: false, caregiverName, error: "Configuration missing" };
   }
   try {
     const response = await fetch('https://api.thesmsworks.co.uk/v1/message/send', {
@@ -1009,23 +1099,130 @@ const sendCaregiverSMS = async (phoneNumber, message) => {
       })
     });
     const data = await response.json();
-    console.log(`SMS sent to ${phoneNumber}:`, data);
-    return true;
+    
+    if (response.ok && data.messageid) {
+      logActivity(profileId, 'SMS_DISPATCH', `SMS sent to ${caregiverName}`, 'SUCCESS', JSON.stringify(data));
+      return { success: true, caregiverName };
+    } else {
+      let errorMsg = data.message || "Unknown error";
+      let displayMsg = `Alert Failed: ${errorMsg}. ${caregiverName} was not notified.`;
+      
+      if ((data.message && data.message.includes('Insufficient Credits')) || data.code === 4021) {
+        displayMsg = `Alert Failed: Insufficient SMS credits. ${caregiverName} was not notified.`;
+      } else if ((data.message && data.message.includes('Invalid Number')) || data.code === 4001) {
+        displayMsg = `Alert Failed: Invalid phone number for ${caregiverName}.`;
+      }
+      
+      logActivity(profileId, 'SMS_DISPATCH', displayMsg, 'ERROR', JSON.stringify(data));
+      return { success: false, caregiverName, error: displayMsg };
+    }
   } catch (error) {
-    console.error(`Failed to send SMS to ${phoneNumber}:`, error);
-    return false;
+    const errorStr = error instanceof Error ? error.message : String(error);
+    const displayMsg = `Alert Failed: Network error. ${caregiverName} was not notified.`;
+    logActivity(profileId, 'SMS_DISPATCH', displayMsg, 'ERROR', errorStr);
+    return { success: false, caregiverName, error: displayMsg };
   }
 };
 
-app.post('/api/caregiver-alert', requireAuth(), (req, res) => {
-  const { smsSummary } = req.body;
-  const userId = req.auth.userId;
+app.post('/api/analyze-document', requireAuth(), checkProfileOwnership, async (req, res) => {
+  const { userId, base64Data, mimeType } = req.body;
+  if (!base64Data || !mimeType || !userId) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    logActivity(userId, 'AI_ANALYSIS', 'Started document analysis', 'PENDING', `MimeType: ${mimeType}`);
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    const modelId = 'gemini-3.1-flash-lite-preview';
+    
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              mimeType: mimeType,
+              data: base64Data
+            }
+          },
+          { text: "Analyze this document. Extract as much detail as possible to fill a contact/appointment form. If a health condition, illness, disorder, or medical term is identified, proactively provide a 'Health Insights' section. This section must be strictly grounded in NHS (National Health Service) guidelines. Provide a concise summary of the condition, typical next steps, and official NHS recommendations. Include a direct prompt for the user to confirm their appointment details. Tone: Empathetic, clinical, and authoritative. Constraint: Always include a disclaimer that this information is for educational purposes and is not a substitute for professional medical advice.\n\nDYNAMIC RESOURCE CURATOR PROTOCOL:\nMonitor inputs for signs of a specific medical diagnosis or condition (e.g., Epilepsy, Diabetes, Asthma).\nIf a condition is identified via medication names or clinical text, you MUST populate the 'supportCardSuggestion' field with the condition details to ask the user if they would like to add a 'Trusted Support Card' to their Help & Info section.\n\nCAREGIVER ALERT PROTOCOL:\nDetermine if the document contains critical information (e.g., new diagnosis, urgent appointment, medication change, or concerning test results). If so, set 'is_critical' to true and provide a brief, professional 'caregiver_sms' (max 140 chars) suitable for sending to a caregiver. Example: 'MemoryMate: A new prescription for [Med Name] was detected for [Name]. Please check the vault.'" }
+        ]
+      },
+      config: {
+        tools: [{ googleSearch: {} }],
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            summary: { type: Type.STRING, description: "A simple summary of the document." },
+            category: { type: Type.STRING, description: "Type of document. MUST be one of: Medical, Appointment, Identification, Medicine, General, Household, Vehicle." },
+            organization: { type: Type.STRING, description: "Name of the hospital, clinic, or organization (e.g. NHS, St Mary's Hospital)" },
+            department: { type: Type.STRING, description: "Specific department (e.g. Cardiology, Radiology)" },
+            contactName: { type: Type.STRING, description: "Name of the doctor or contact person." },
+            contactPhone: { type: Type.STRING, description: "Phone number." },
+            contactEmail: { type: Type.STRING, description: "Email address." },
+            isAppointment: { type: Type.BOOLEAN, description: "True if the document is an appointment letter or card." },
+            appointmentDate: { type: Type.STRING, description: "Date of the appointment in YYYY-MM-DD format." },
+            appointmentTime: { type: Type.STRING, description: "Time of the appointment in HH:MM format." },
+            location: { type: Type.STRING, description: "Full address or location of the appointment/service." },
+            healthInsights: { type: Type.STRING, description: "If a health condition is identified, provide a professional, supportive summary grounded in NHS guidelines. Include a brief overview, commonly recommended NHS pathways/self-care tips, a prompt to confirm appointment details, and a mandatory disclaimer that it is for educational purposes." },
+            supportCardSuggestion: {
+              type: Type.OBJECT,
+              description: "A suggestion to add a Trusted Support Card to the user's Help & Info section if a condition is detected.",
+              properties: {
+                detected_condition: { type: Type.STRING, description: "The medical condition (e.g., Epilepsy)." },
+                suggest_card: { type: Type.BOOLEAN, description: "Must be true." },
+                nhs_url: { type: Type.STRING, description: "The official NHS URL for the condition." },
+                charity_url: { type: Type.STRING, description: "A leading UK-based organization for that condition." },
+                message: { type: Type.STRING, description: "A message confirming the card is being added." },
+                category: { type: Type.STRING, description: "Which 'Trusted Health Information' category it belongs to (e.g., 'Understanding Epilepsy')." }
+              },
+              required: ["detected_condition", "suggest_card", "nhs_url", "charity_url", "message", "category"]
+            },
+            is_critical: { type: Type.BOOLEAN, description: "Set to true if the document mentions a new medication, a change in dosage, a new diagnosis, or an urgent upcoming appointment." },
+            caregiver_sms: { type: Type.STRING, description: "A concise, empathetic summary (max 140 characters)." }
+          },
+          required: ["summary", "category", "isAppointment"],
+        }
+      }
+    });
+
+    const analysis = JSON.parse(response.text || '{}');
+    logActivity(userId, 'AI_ANALYSIS', `Finished document analysis. Critical: ${!!analysis.is_critical}`, 'SUCCESS', response.text);
+    
+    let smsResults = [];
+    if (analysis.is_critical && analysis.caregiver_sms) {
+      const caregivers = await new Promise((resolve, reject) => {
+        db.all("SELECT * FROM caregivers WHERE userId = ? AND alertsEnabled = 1", [userId], (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        });
+      });
+      
+      for (const caregiver of caregivers) {
+        const result = await sendCaregiverSMS(caregiver.phoneNumber, analysis.caregiver_sms, userId, caregiver.name);
+        smsResults.push(result);
+      }
+    }
+    
+    res.json({ ...analysis, smsResults });
+
+  } catch (error) {
+    console.error("Document Analysis Error:", error);
+    const errorStr = error instanceof Error ? error.message : String(error);
+    logActivity(userId, 'AI_ANALYSIS', 'Failed document analysis', 'ERROR', errorStr);
+    res.status(500).json({ error: "Failed to analyze document" });
+  }
+});
+
+app.post('/api/caregiver-alert', requireAuth(), checkProfileOwnership, (req, res) => {
+  const { userId, smsSummary } = req.body;
 
   if (!smsSummary) {
     return res.status(400).json({ error: "smsSummary is required" });
   }
 
-  db.all("SELECT * FROM caregivers WHERE user_id = ? AND alerts_enabled = 1", [userId], async (err, caregivers) => {
+  db.all("SELECT * FROM caregivers WHERE userId = ? AND alertsEnabled = 1", [userId], async (err, caregivers) => {
     if (err) {
       console.error("Error fetching caregivers:", err);
       return res.status(500).json({ error: "Database error" });
@@ -1038,7 +1235,7 @@ app.post('/api/caregiver-alert', requireAuth(), (req, res) => {
 
     let successCount = 0;
     for (const caregiver of caregivers) {
-      const success = await sendCaregiverSMS(caregiver.phone_number, smsSummary);
+      const success = await sendCaregiverSMS(caregiver.phoneNumber, smsSummary);
       if (success) successCount++;
     }
 
@@ -1047,36 +1244,66 @@ app.post('/api/caregiver-alert', requireAuth(), (req, res) => {
 });
 
 // Caregiver CRUD
-app.get('/api/caregivers', requireAuth(), (req, res) => {
-  db.all("SELECT * FROM caregivers WHERE user_id = ?", [req.auth.userId], (err, rows) => {
+app.get('/api/caregivers/:userId', requireAuth(), checkProfileOwnership, (req, res) => {
+  console.log(`--- Incoming Request: [${req.method}] [${req.url}] ---`);
+  db.all("SELECT * FROM caregivers WHERE userId = ?", [req.params.userId], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows || []);
   });
 });
 
-app.post('/api/caregivers', requireAuth(), (req, res) => {
-  const { id, name, phone_number, relationship, alerts_enabled } = req.body;
-  const sql = `INSERT INTO caregivers (id, user_id, name, phone_number, relationship, alerts_enabled) VALUES (?, ?, ?, ?, ?, ?)`;
-  db.run(sql, [id, req.auth.userId, name, phone_number, relationship, alerts_enabled === false ? 0 : 1], (err) => {
-    if (err) return res.status(500).json({ error: err.message });
+app.post('/api/caregivers', requireAuth(), checkProfileOwnership, (req, res) => {
+  console.log(`--- Incoming Request: [${req.method}] [${req.url}] ---`);
+  console.log(`[POST /api/caregivers] req.body:`, req.body);
+  console.log(`[POST /api/caregivers] req.auth:`, req.auth);
+  const { id, userId, name, phoneNumber, relationship, alertsEnabled } = req.body;
+  const sql = `INSERT INTO caregivers (id, userId, name, phoneNumber, relationship, alertsEnabled) VALUES (?, ?, ?, ?, ?, ?)`;
+  db.run(sql, [id, userId, name, phoneNumber, relationship, alertsEnabled === false ? 0 : 1], function(err) {
+    if (err) {
+      console.error(`[POST /api/caregivers] Database Insert Error:`, err.message);
+      return res.status(500).json({ error: err.message });
+    }
     res.json({ success: true });
   });
 });
 
 app.put('/api/caregivers/:id', requireAuth(), (req, res) => {
-  const { name, phone_number, relationship, alerts_enabled } = req.body;
-  const sql = `UPDATE caregivers SET name=?, phone_number=?, relationship=?, alerts_enabled=? WHERE id=? AND user_id=?`;
-  db.run(sql, [name, phone_number, relationship, alerts_enabled === false ? 0 : 1, req.params.id, req.auth.userId], (err) => {
+  verifyItemOwnership('caregivers', req.params.id, req.auth.userId, (err, isOwner) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true });
+    if (!isOwner) return res.status(403).json({ error: "Forbidden" });
+
+    const { name, phoneNumber, relationship, alertsEnabled } = req.body;
+    const sql = `UPDATE caregivers SET name=?, phoneNumber=?, relationship=?, alertsEnabled=? WHERE id=?`;
+    db.run(sql, [name, phoneNumber, relationship, alertsEnabled === false ? 0 : 1, req.params.id], (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ success: true });
+    });
   });
 });
 
 app.delete('/api/caregivers/:id', requireAuth(), (req, res) => {
-  db.run("DELETE FROM caregivers WHERE id=? AND user_id=?", [req.params.id, req.auth.userId], (err) => {
+  verifyItemOwnership('caregivers', req.params.id, req.auth.userId, (err, isOwner) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true });
+    if (!isOwner) return res.status(403).json({ error: "Forbidden" });
+
+    db.run("DELETE FROM caregivers WHERE id=?", [req.params.id], (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ success: true });
+    });
   });
+});
+
+// Activity Logs Endpoint
+app.get('/api/logs/:profileId', requireAuth(), checkProfileOwnership, (req, res) => {
+  const { profileId } = req.params;
+  db.all(
+    "SELECT * FROM activity_logs WHERE profileId = ? ORDER BY timestamp DESC LIMIT 50",
+    [profileId],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(rows);
+    }
+  );
 });
 
 // Vite middleware for development (MUST be after API routes)

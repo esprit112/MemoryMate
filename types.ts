@@ -2,11 +2,11 @@
 
 export interface Caregiver {
   id: string;
-  user_id: string;
+  userId: string;
   name: string;
-  phone_number: string;
+  phoneNumber: string;
   relationship: string;
-  alerts_enabled: boolean;
+  alertsEnabled: boolean;
 }
 
 export interface ActivityLog {

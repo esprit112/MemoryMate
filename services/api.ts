@@ -1,6 +1,6 @@
 import { Reminder, UserProfile, UserDocument, Medicine, SupportCard, ActivityLog } from '../types';
 
-const getApiBase = () => {
+export const getApiBase = () => {
   const stored = localStorage.getItem('MEMORYMATE_API_URL');
   if (stored) return stored;
   return '/api';
@@ -9,7 +9,7 @@ const getApiBase = () => {
 let getTokenFn: (() => Promise<string | null>) | null = null;
 export const setGetToken = (fn: () => Promise<string | null>) => { getTokenFn = fn; };
 
-const getHeaders = async (additionalHeaders: Record<string, string> = {}) => {
+export const getHeaders = async (additionalHeaders: Record<string, string> = {}) => {
   const headers: Record<string, string> = { ...additionalHeaders };
   if (getTokenFn) {
     const token = await getTokenFn();
@@ -24,7 +24,15 @@ export const fetchUsers = async (): Promise<UserProfile[]> => {
   const res = await fetch(`${getApiBase()}/users`, {
     headers: await getHeaders()
   });
-  if (!res.ok) throw new Error('Failed to fetch users');
+  if (!res.ok) {
+    if (res.status === 503) {
+      const errData = await res.json().catch(() => null);
+      if (errData && errData.error === "DNS_TIMEOUT") {
+        throw new Error(JSON.stringify(errData));
+      }
+    }
+    throw new Error('Failed to fetch users');
+  }
   return res.json();
 };
 
@@ -118,7 +126,10 @@ export const createDocument = async (doc: UserDocument): Promise<UserDocument> =
     headers: await getHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(doc),
   });
-  if (!res.ok) throw new Error('Failed to upload document');
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.error || 'Failed to upload document');
+  }
   return res.json();
 };
 
@@ -282,11 +293,11 @@ export const restoreBackup = async (base64Data: string): Promise<void> => {
   if (!res.ok) throw new Error('Restore failed');
 };
 
-export const triggerCaregiverAlert = async (smsSummary: string): Promise<void> => {
+export const triggerCaregiverAlert = async (userId: string, smsSummary: string): Promise<void> => {
   const res = await fetch(`${getApiBase()}/caregiver-alert`, {
     method: 'POST',
     headers: await getHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ smsSummary }),
+    body: JSON.stringify({ userId, smsSummary }),
   });
   if (!res.ok) throw new Error('Failed to trigger caregiver alert');
 };

@@ -73,7 +73,7 @@ const VisionAssistant: React.FC<VisionAssistantProps> = React.memo(({ userId }) 
     
     setIsLoading(true);
     try {
-      const result = await analyzeImage(image, prompt, mimeType);
+      const result = await analyzeImage(userId, image, prompt, mimeType);
       setAnalysis(result.text || "I couldn't clearly see what was in the image.");
       if (result.supportCardSuggestion) {
         setSupportCardSuggestion(result.supportCardSuggestion);

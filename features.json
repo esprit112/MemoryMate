@@ -66,6 +66,21 @@
       "id": "caregiver_circle",
       "name": "Caregiver Circle & Automated SMS Alerts",
       "description": "Allows users to add caregivers to their profile. When the AI detects critical medical information (e.g., new diagnosis, urgent appointment) in uploaded documents or images, it automatically triggers an SMS alert to all active caregivers via The SMS Works API."
+    },
+    {
+      "id": "system_event_console",
+      "name": "Real-Time System Event Console",
+      "description": "A developer-style modal console providing real-time visibility into background system events, such as AI document analysis progress, SMS dispatch statuses, and error tracking."
+    },
+    {
+      "id": "offline_sync_notifications",
+      "name": "Offline Sync & Background Notifications",
+      "description": "A background service that checks for missed reminders upon server startup and periodically polls to ensure users receive timely notifications even if they were offline."
+    },
+    {
+      "id": "auto_file_processing",
+      "name": "Automated Directory Processing",
+      "description": "Automatically detects and processes files dropped into a user's local 'Uploaded' directory, queuing them for AI analysis and integration into the Document Vault."
     }
   ]
 }

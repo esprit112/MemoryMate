@@ -10,9 +10,10 @@ interface UserSelectionProps {
   onSelect: (user: UserProfile) => void;
   isDarkMode?: boolean;
   onToggleTheme?: () => void;
+  onHandshakeError?: (error: any) => void;
 }
 
-const UserSelection: React.FC<UserSelectionProps> = ({ onSelect, isDarkMode = false, onToggleTheme }) => {
+const UserSelection: React.FC<UserSelectionProps> = ({ onSelect, isDarkMode = false, onToggleTheme, onHandshakeError }) => {
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [isCreating, setIsCreating] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -30,8 +31,16 @@ const UserSelection: React.FC<UserSelectionProps> = ({ onSelect, isDarkMode = fa
       // Sort users alphabetically by name
       const sortedUsers = data.sort((a, b) => a.name.localeCompare(b.name));
       setUsers(sortedUsers);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to load users", error);
+      try {
+        const errData = JSON.parse(error.message);
+        if (errData.error === "DNS_TIMEOUT" && onHandshakeError) {
+          onHandshakeError(errData);
+        }
+      } catch (e) {
+        // Not a JSON error string
+      }
     } finally {
       setLoading(false);
     }

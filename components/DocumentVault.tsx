@@ -1,10 +1,13 @@
 
 import React, { useState, useEffect } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
 import { SupportCardSuggestion, UserProfile, UserDocument, Reminder } from '../types';
-import { FileText, Upload, Trash2, Bot, Loader2, Image as ImageIcon, Eye, X, CalendarPlus, Check, Building2, User, Phone, MapPin, Mail, Sparkles, HeartPulse, Calendar, IdCard, Pill, Home, Car, RotateCcw } from 'lucide-react';
+import { FileText, Upload, Trash2, Bot, Loader2, Image as ImageIcon, Eye, X, CalendarPlus, Check, Building2, User, Phone, MapPin, Mail, Sparkles, HeartPulse, Calendar, IdCard, Pill, Home, Car, RotateCcw, Activity } from 'lucide-react';
 import { analyzeDocument, DocumentAnalysisResult } from '../services/geminiService';
 import { generateId, compressImage } from '../utils/helpers';
 import * as api from '../services/api';
+import DocumentViewer from './DocumentViewer';
+import SystemLogs from './SystemLogs';
 
 interface DocumentVaultProps {
   user: UserProfile;
@@ -32,10 +35,12 @@ const DocumentVault: React.FC<DocumentVaultProps> = React.memo(({ user, onRemind
   
   // Modal State
   const [showModal, setShowModal] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
   
   // Form State
   const [docFile, setDocFile] = useState<{data: string, mime: string, name: string} | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
   
   const [formData, setFormData] = useState({
     name: '',
@@ -74,10 +79,24 @@ const DocumentVault: React.FC<DocumentVaultProps> = React.memo(({ user, onRemind
     }
   };
 
+  const showToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 5000);
+  };
+
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     
+    // Check for duplicate filename
+    const isDuplicate = documents.some(d => d.name === file.name);
+    if (isDuplicate) {
+      showToast(`A file named '${file.name}' already exists. Please rename the new file to continue.`, 'error');
+      // Reset input so the same file can be selected again if renamed
+      e.target.value = '';
+      return;
+    }
+
     // Reset Form
     setDocFile(null);
     setFormData({
@@ -105,7 +124,7 @@ const DocumentVault: React.FC<DocumentVaultProps> = React.memo(({ user, onRemind
         
         // Compress if image
         if (file.type.startsWith('image/')) {
-            const compressed = await compressImage(base64String, 1200, 0.8);
+            const compressed = await compressImage(base64String, 1000, 0.7);
             finalBase64 = compressed.split(',')[1];
         }
 
@@ -117,7 +136,7 @@ const DocumentVault: React.FC<DocumentVaultProps> = React.memo(({ user, onRemind
 
         // Trigger AI Analysis
         try {
-            const analysis = await analyzeDocument(finalBase64, file.type);
+            const analysis = await analyzeDocument(user.id, finalBase64, file.type);
             if (analysis) {
                 setFormData(prev => ({
                     ...prev,
@@ -134,14 +153,29 @@ const DocumentVault: React.FC<DocumentVaultProps> = React.memo(({ user, onRemind
                     healthInsights: analysis.healthInsights || '',
                     supportCardSuggestion: analysis.supportCardSuggestion || null
                 }));
+                
+                if (analysis.is_critical) {
+                    if (analysis.smsResults && analysis.smsResults.length > 0) {
+                        analysis.smsResults.forEach(res => {
+                            if (res.success) {
+                                showToast(`Caregiver Alerted: SMS sent to ${res.caregiverName}.`, 'success');
+                            } else {
+                                showToast(res.error || `Alert Failed: ${res.caregiverName} was not notified.`, 'error');
+                            }
+                        });
+                    } else {
+                        showToast("Critical information detected. Caregivers have been notified.", "info");
+                    }
+                }
             }
         } catch (aiError) {
             console.error("AI Auto-fill failed", aiError);
+            showToast("Failed to auto-fill document details.", "error");
         }
 
       } catch (err) {
         console.error(err);
-        alert("Failed to process file.");
+        showToast("Failed to process file.", "error");
       } finally {
         setIsAnalyzing(false);
       }
@@ -238,9 +272,9 @@ const DocumentVault: React.FC<DocumentVaultProps> = React.memo(({ user, onRemind
         setShowModal(false);
         setDocFile(null);
         await loadDocs();
-    } catch (err) {
+    } catch (err: any) {
         console.error(err);
-        alert("Failed to save document.");
+        alert(err.message || "Failed to save document.");
     } finally {
         setLoading(false);
     }
@@ -292,32 +326,7 @@ const DocumentVault: React.FC<DocumentVaultProps> = React.memo(({ user, onRemind
       
       {/* Document Viewer Modal */}
       {viewingDoc && (
-        <div className="fixed inset-0 z-[60] bg-slate-900/95 flex flex-col p-4 animate-fade-in">
-          <div className="flex justify-between items-center text-white mb-4">
-            <h2 className="text-xl font-bold truncate pr-4">{viewingDoc.name}</h2>
-            <button 
-              onClick={() => setViewingDoc(null)}
-              className="p-2 bg-white/10 rounded-full hover:bg-white/20"
-            >
-              <X className="w-6 h-6" />
-            </button>
-          </div>
-          <div className="flex-1 bg-white/5 rounded-2xl overflow-hidden flex items-center justify-center relative">
-             {viewingDoc.type === 'pdf' ? (
-                <iframe 
-                  src={`data:application/pdf;base64,${viewingDoc.data}`} 
-                  className="w-full h-full"
-                  title="PDF Viewer"
-                />
-             ) : (
-                <img 
-                  src={`data:${viewingDoc.mimeType};base64,${viewingDoc.data}`} 
-                  alt={viewingDoc.name}
-                  className="max-w-full max-h-full object-contain"
-                />
-             )}
-          </div>
-        </div>
+        <DocumentViewer document={viewingDoc} onClose={() => setViewingDoc(null)} />
       )}
 
       {/* Upload Modal */}
@@ -442,13 +451,27 @@ const DocumentVault: React.FC<DocumentVaultProps> = React.memo(({ user, onRemind
          <h2 className="text-lg font-bold text-slate-800 dark:text-slate-200">
             Saved Letters
          </h2>
-         <button 
-           onClick={() => setShowModal(true)}
-           className="bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 border border-indigo-500/30 px-4 py-2 rounded-full font-bold text-sm flex items-center gap-1 hover:bg-indigo-500/30 backdrop-blur-sm transition-colors"
-         >
-           <Upload className="w-4 h-4" /> Upload Letter
-         </button>
+         <div className="flex gap-2">
+           <button 
+             onClick={() => setShowLogs(true)}
+             className="bg-slate-500/20 text-slate-700 dark:text-slate-300 border border-slate-500/30 px-4 py-2 rounded-full font-bold text-sm flex items-center gap-1 hover:bg-slate-500/30 backdrop-blur-sm transition-colors"
+           >
+             <Activity className="w-4 h-4" /> Logs
+           </button>
+           <button 
+             onClick={() => setShowModal(true)}
+             className="bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 border border-indigo-500/30 px-4 py-2 rounded-full font-bold text-sm flex items-center gap-1 hover:bg-indigo-500/30 backdrop-blur-sm transition-colors"
+           >
+             <Upload className="w-4 h-4" /> Upload Letter
+           </button>
+         </div>
       </div>
+
+      <AnimatePresence>
+        {showLogs && (
+          <SystemLogs profileId={user.id} onClose={() => setShowLogs(false)} />
+        )}
+      </AnimatePresence>
 
       <div className="space-y-4">
         {documents.map((doc) => {
@@ -568,6 +591,28 @@ const DocumentVault: React.FC<DocumentVaultProps> = React.memo(({ user, onRemind
           </div>
         )}
       </div>
+
+      {/* Toast Notification */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 20 }}
+            className={`fixed bottom-4 right-4 z-[9999] p-4 rounded-xl shadow-lg flex items-center gap-3 text-white ${
+              toast.type === 'success' ? 'bg-emerald-500' : 
+              toast.type === 'error' ? 'bg-red-500' : 'bg-indigo-500'
+            }`}
+          >
+            {toast.type === 'success' ? <Check className="w-5 h-5" /> : 
+             toast.type === 'error' ? <X className="w-5 h-5" /> : <Sparkles className="w-5 h-5" />}
+            <span className="font-medium text-sm">{toast.message}</span>
+            <button onClick={() => setToast(null)} className="ml-2 hover:opacity-80">
+              <X className="w-4 h-4" />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 });

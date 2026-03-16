@@ -22,6 +22,7 @@ import ProfileView from './components/ProfileView';
 import PersonalInfoView from './components/PersonalInfoView';
 import SettingsModal from './components/SettingsModal';
 import CaregiverCircle from './components/CaregiverCircle';
+import Header from './components/Header';
 import { Reminder, TabView, UserProfile, UserDocument } from './types';
 import { Plus, LogOut, UserCog, Sun, Moon, Settings, MessageCircle, X } from 'lucide-react';
 import * as api from './services/api';
@@ -39,6 +40,7 @@ const App: React.FC = () => {
   const [showProfile, setShowProfile] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [isChatOpen, setIsChatOpen] = useState(false);
+  const [handshakeError, setHandshakeError] = useState<{message: string, technical: string} | null>(null);
   const { user: clerkUser, isLoaded: isClerkLoaded } = useUser();
   const { getToken, isLoaded: isAuthLoaded, isSignedIn, signOut } = useAuth();
 
@@ -121,7 +123,7 @@ const App: React.FC = () => {
 
         for (const doc of pending) {
           try {
-            const analysis = await analyzeDocument(doc.data, doc.mimeType);
+            const analysis = await analyzeDocument(currentUser.id, doc.data, doc.mimeType);
             if (analysis) {
               const updatedDoc: UserDocument = {
                 ...doc,
@@ -387,7 +389,7 @@ const App: React.FC = () => {
       case TabView.DOCUMENTS:
         return (
            <div className="max-w-3xl mx-auto animate-fade-in">
-             <header className="p-4 glass-panel backdrop-blur-md border-b border-white/20 shadow-sm z-10 sticky top-0">
+             <header className="p-4 glass-panel backdrop-blur-md border-b border-white/20 shadow-sm z-10 sticky top-16">
               <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100 drop-shadow-sm">Documents</h1>
             </header>
             <DocumentVault user={user} />
@@ -396,7 +398,7 @@ const App: React.FC = () => {
       case TabView.VISION:
          return (
           <div className="max-w-3xl mx-auto animate-fade-in">
-             <header className="p-4 glass-panel backdrop-blur-md border-b border-white/20 shadow-sm z-10 sticky top-0">
+             <header className="p-4 glass-panel backdrop-blur-md border-b border-white/20 shadow-sm z-10 sticky top-16">
               <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100 drop-shadow-sm">Vision Helper</h1>
             </header>
             <VisionAssistant userId={user.id} />
@@ -411,7 +413,7 @@ const App: React.FC = () => {
       case TabView.RESOURCES:
         return (
           <div className="max-w-3xl mx-auto animate-fade-in">
-            <header className="p-4 glass-panel backdrop-blur-md border-b border-white/20 shadow-sm z-10 sticky top-0">
+            <header className="p-4 glass-panel backdrop-blur-md border-b border-white/20 shadow-sm z-10 sticky top-16">
               <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100 drop-shadow-sm">Help & Info</h1>
             </header>
             <ResourcesView userId={user.id} />
@@ -430,6 +432,20 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen font-sans transition-colors duration-300">
+      {handshakeError && (
+        <div 
+          className="fixed top-0 left-0 right-0 bg-red-500 text-white p-4 text-center shadow-lg flex justify-between items-center" 
+          style={{ zIndex: 9999 }}
+        >
+          <div className="flex-1">
+            <p className="font-bold">Login Error: {handshakeError.message}. Please try again.</p>
+            {handshakeError.technical && <p className="text-sm opacity-80">Technical: {handshakeError.technical}</p>}
+          </div>
+          <button onClick={() => setHandshakeError(null)} className="p-2 hover:bg-red-600 rounded-full transition-colors">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+      )}
       <Show when="signed-out">
         <div className="min-h-screen flex flex-col items-center justify-center p-4">
           <div className="max-w-md w-full glass-panel p-8 rounded-3xl shadow-2xl border border-white/20 text-center relative z-10">
@@ -465,42 +481,21 @@ const App: React.FC = () => {
             onSelect={setCurrentUser} 
             isDarkMode={isDarkMode}
             onToggleTheme={() => setIsDarkMode(!isDarkMode)}
+            onHandshakeError={(err) => {
+              signOut();
+              setHandshakeError({ message: err.message, technical: err.technical });
+            }}
           />
         ) : (
-          <div className="pb-20">
-            <div className="fixed top-0 right-0 p-4 z-50 flex gap-2 items-center">
-              <div className="mr-2">
-                <UserButton />
-              </div>
-              <button
-                onClick={() => setIsDarkMode(!isDarkMode)}
-                className="glass-panel p-2 rounded-full shadow-sm text-amber-500 hover:bg-amber-50 dark:hover:bg-slate-700 transition-colors"
-                title={isDarkMode ? "Switch to Light Mode" : "Switch to Dark Mode"}
-              >
-                {isDarkMode ? <Sun className="w-6 h-6" /> : <Moon className="w-6 h-6" />}
-              </button>
-              <button 
-                onClick={() => setShowSettings(true)}
-                className="glass-panel p-2 rounded-full shadow-sm text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"
-                title="System Settings"
-              >
-                <Settings className="w-6 h-6" />
-              </button>
-              <button 
-                onClick={() => setShowProfile(true)}
-                className="glass-panel p-2 rounded-full shadow-sm text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 transition-colors"
-                title="Edit Profile"
-              >
-                <UserCog className="w-6 h-6" />
-              </button>
-              <button 
-                onClick={() => setCurrentUser(null)}
-                className="glass-panel p-2 rounded-full shadow-sm text-slate-500 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
-                title="Switch User"
-              >
-                <LogOut className="w-6 h-6" />
-              </button>
-            </div>
+          <div className="pb-20 pt-16">
+            <Header 
+              currentUser={currentUser}
+              isDarkMode={isDarkMode}
+              onToggleTheme={() => setIsDarkMode(!isDarkMode)}
+              onShowSettings={() => setShowSettings(true)}
+              onShowProfile={() => setShowProfile(true)}
+              onSwitchUser={() => setCurrentUser(null)}
+            />
 
             <motion.div layout className="relative z-10">
               {renderContent(currentUser!)}
