@@ -1444,6 +1444,16 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // Bind to 0.0.0.0 to allow network access
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+  console.error('SERVER ERROR:', err.stack);
+  res.status(500).json({ error: 'Internal Server Error', message: err.message });
+});
+
+// Export the app for Vercel Serverless Functions
+export default app;
+
+
+
 });
