@@ -27,7 +27,8 @@ if (fs.existsSync('.env')) {
 import cors from 'cors';
 import chokidar from 'chokidar';
 import { clerkMiddleware, getAuth } from '@clerk/express';
-import { createClient } from '@libsql/client';
+import pg from 'pg';
+import sqlite3 from 'sqlite3';
 
 // Task 2: Fix the "Loaded: false" Issue & Environment Check
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
@@ -43,6 +44,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const isDev = process.env.NODE_ENV !== 'production';
 
 // Task 4: Database Pathing
 const PERSISTENT_ROOT = fs.existsSync('/data') ? '/data' : path.join(__dirname, 'data');
@@ -50,16 +52,56 @@ const DB_PATH = process.env.DB_PATH || path.join(PERSISTENT_ROOT, 'memorymate.db
 const USERS_BASE_DIR = process.env.USERS_BASE_DIR || (PERSISTENT_ROOT === '/data' ? '/data' : path.join(PERSISTENT_ROOT, 'users'));
 
 // Task 1: Hybrid Database Adapter
-const isDev = process.env.NODE_ENV === 'development';
-const dbUrl = isDev ? `file:${DB_PATH}` : "libsql://memorymate-memorymate.aws-eu-west-1.turso.io";
-const dbToken = isDev ? undefined : process.env.TURSO_AUTH_TOKEN;
+const usePostgres = !!process.env.POSTGRES_URL;
+let dbPool = null;
+let sqliteDb = null;
 
-const db = createClient({
-  url: dbUrl,
-  authToken: dbToken,
-});
+if (usePostgres) {
+  dbPool = new pg.Pool({
+    connectionString: process.env.POSTGRES_URL,
+    ssl: { rejectUnauthorized: false }
+  });
+  console.log(`[SYSTEM] Database Status: Supabase/Postgres Cloud Mode Active.`);
+} else {
+  sqliteDb = new sqlite3.Database(DB_PATH);
+  console.log(`Database initialized: Local SQLite mode active.`);
+}
 
-console.log(`Database initialized: ${isDev ? 'Local' : 'Cloud'} mode active.`);
+/**
+ * Universal Query Wrapper
+ * Uses Postgres-style $1, $2... placeholders.
+ * Automatically converts to ? for SQLite.
+ */
+async function dbQuery(text, params = []) {
+  if (usePostgres) {
+    try {
+      const result = await dbPool.query(text, params);
+      return { rows: result.rows, rowsAffected: result.rowCount };
+    } catch (err) {
+      console.error(`[POSTGRES ERROR] Code: ${err.code} | Message: ${err.message} | Query: ${text}`);
+      throw err;
+    }
+  } else {
+    // Convert $1, $2... to ? for SQLite
+    const sqliteText = text.replace(/\$\d+/g, '?');
+    return new Promise((resolve, reject) => {
+      const trimmedQuery = sqliteText.trim().toUpperCase();
+      const isSelect = trimmedQuery.startsWith('SELECT') || trimmedQuery.startsWith('WITH') || trimmedQuery.startsWith('PRAGMA');
+      
+      if (isSelect) {
+        sqliteDb.all(sqliteText, params, (err, rows) => {
+          if (err) return reject(err);
+          resolve({ rows: rows || [], rowsAffected: (rows || []).length });
+        });
+      } else {
+        sqliteDb.run(sqliteText, params, function(err) {
+          if (err) return reject(err);
+          resolve({ rows: [], rowsAffected: this.changes });
+        });
+      }
+    });
+  }
+}
 
 // Ensure base directories exist
 [PERSISTENT_ROOT, USERS_BASE_DIR].forEach(dir => {
@@ -126,11 +168,11 @@ app.use(express.static(path.join(__dirname, 'dist')));
 async function initializeDatabase() {
   try {
     // Apply PRAGMAs (only for local SQLite)
-    if (isDev) {
-      await db.execute('PRAGMA journal_mode = WAL;');
-      await db.execute('PRAGMA synchronous = NORMAL;');
-      await db.execute('PRAGMA busy_timeout = 5000;');
-      await db.execute('PRAGMA foreign_keys = ON;');
+    if (!usePostgres) {
+      await dbQuery('PRAGMA journal_mode = WAL;');
+      await dbQuery('PRAGMA synchronous = NORMAL;');
+      await dbQuery('PRAGMA busy_timeout = 5000;');
+      await dbQuery('PRAGMA foreign_keys = ON;');
     }
     
     await createTables();
@@ -139,7 +181,7 @@ async function initializeDatabase() {
   } catch (error) {
     console.error('Critical failure during database initialization:', error);
     // Don't exit in production/Vercel as it might be a transient error
-    if (isDev) process.exit(1);
+    if (!usePostgres) process.exit(1);
   }
 }
 
@@ -148,7 +190,7 @@ initializeDatabase();
 // Ensure user directories exist for all users in DB
 async function ensureUserDirectories() {
   try {
-    const { rows } = await db.execute("SELECT name FROM users");
+    const { rows } = await dbQuery("SELECT name FROM users");
     if (!rows) return;
     for (const user of rows) {
       const userDir = path.join(USERS_BASE_DIR, user.name);
@@ -169,11 +211,12 @@ async function ensureUserDirectories() {
 }
 
 async function createTables() {
+  const blobType = usePostgres ? 'BYTEA' : 'BLOB';
   try {
     // Users Table
-    await db.execute(`CREATE TABLE IF NOT EXISTS users (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
-      clerkUserId TEXT,
+      clerkUserId TEXT UNIQUE,
       name TEXT,
       avatarColor TEXT,
       createdAt TEXT,
@@ -226,11 +269,11 @@ async function createTables() {
       { name: 'notificationLimit', type: 'INTEGER' }
     ];
     for (const col of userColumns) {
-      try { await db.execute(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`); } catch (_e) { console.log(`Column ${col.name} already exists or error adding it.`); }
+      try { await dbQuery(`ALTER TABLE users ADD COLUMN ${col.name} ${col.type}`); } catch (_e) { /* ignore */ }
     }
 
     // Reminders Table
-    await db.execute(`CREATE TABLE IF NOT EXISTS reminders (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS reminders (
       id TEXT PRIMARY KEY,
       userId TEXT,
       title TEXT,
@@ -257,11 +300,11 @@ async function createTables() {
       { name: 'sentDayOf', type: 'INTEGER DEFAULT 0' }
     ];
     for (const col of reminderCols) {
-      try { await db.execute(`ALTER TABLE reminders ADD COLUMN ${col.name} ${col.type}`); } catch (_e) { console.log(`Column ${col.name} already exists or error adding it.`); }
+      try { await dbQuery(`ALTER TABLE reminders ADD COLUMN ${col.name} ${col.type}`); } catch (_e) { /* ignore */ }
     }
 
     // Caregivers Table
-    await db.execute(`CREATE TABLE IF NOT EXISTS caregivers (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS caregivers (
       id TEXT PRIMARY KEY,
       userId TEXT,
       name TEXT,
@@ -269,12 +312,12 @@ async function createTables() {
       phoneNumber TEXT,
       alertsEnabled INTEGER
     )`);
-    try { await db.execute("ALTER TABLE caregivers RENAME COLUMN user_id TO userId"); } catch (_e) { console.log("Column user_id already exists or error renaming it."); }
-    try { await db.execute("ALTER TABLE caregivers RENAME COLUMN phone_number TO phoneNumber"); } catch (_e) { console.log("Column phone_number already exists or error renaming it."); }
-    try { await db.execute("ALTER TABLE caregivers RENAME COLUMN alerts_enabled TO alertsEnabled"); } catch (_e) { console.log("Column alerts_enabled already exists or error renaming it."); }
+    try { await dbQuery("ALTER TABLE caregivers RENAME COLUMN user_id TO userId"); } catch (_e) { /* ignore */ }
+    try { await dbQuery("ALTER TABLE caregivers RENAME COLUMN phone_number TO phoneNumber"); } catch (_e) { /* ignore */ }
+    try { await dbQuery("ALTER TABLE caregivers RENAME COLUMN alerts_enabled TO alertsEnabled"); } catch (_e) { /* ignore */ }
 
     // Activity Logs Table
-    await db.execute(`CREATE TABLE IF NOT EXISTS activity_logs (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS activity_logs (
       id TEXT PRIMARY KEY,
       userId TEXT,
       action_type TEXT,
@@ -286,10 +329,10 @@ async function createTables() {
       deleted_data TEXT,
       FOREIGN KEY(userId) REFERENCES users(id)
     )`);
-    try { await db.execute("ALTER TABLE activity_logs ADD COLUMN deleted_data TEXT"); } catch (_e) { console.log("Column deleted_data already exists or error adding it."); }
+    try { await dbQuery("ALTER TABLE activity_logs ADD COLUMN deleted_data TEXT"); } catch (_e) { /* ignore */ }
 
     // Documents Table
-    await db.execute(`CREATE TABLE IF NOT EXISTS documents (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS documents (
       id TEXT PRIMARY KEY,
       userId TEXT,
       name TEXT,
@@ -309,12 +352,12 @@ async function createTables() {
       location TEXT,
       status TEXT DEFAULT 'active',
       filePath TEXT,
-      file_blob BLOB,
+      file_blob ${blobType},
       FOREIGN KEY(userId) REFERENCES users(id)
     )`);
-    try { await db.execute("ALTER TABLE documents ADD COLUMN status TEXT DEFAULT 'active'"); } catch (_e) { console.log("Column status already exists or error adding it."); }
-    try { await db.execute("ALTER TABLE documents ADD COLUMN filePath TEXT"); } catch (_e) { console.log("Column filePath already exists or error adding it."); }
-    try { await db.execute("ALTER TABLE documents ADD COLUMN file_blob BLOB"); } catch (_e) { console.log("Column file_blob already exists or error adding it."); }
+    try { await dbQuery("ALTER TABLE documents ADD COLUMN status TEXT DEFAULT 'active'"); } catch (_e) { /* ignore */ }
+    try { await dbQuery("ALTER TABLE documents ADD COLUMN filePath TEXT"); } catch (_e) { /* ignore */ }
+    try { await dbQuery(`ALTER TABLE documents ADD COLUMN file_blob ${blobType}`); } catch (_e) { /* ignore */ }
     
     const docColumns = [
       { name: 'category', type: 'TEXT' },
@@ -328,12 +371,12 @@ async function createTables() {
       { name: 'location', type: 'TEXT' }
     ];
     for (const col of docColumns) {
-      try { await db.execute(`ALTER TABLE documents ADD COLUMN ${col.name} ${col.type}`); } catch (_e) { console.log(`Column ${col.name} already exists or error adding it.`); }
+      try { await dbQuery(`ALTER TABLE documents ADD COLUMN ${col.name} ${col.type}`); } catch (_e) { /* ignore */ }
     }
-    try { await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS unique_profile_file ON documents(userId, name)"); } catch (_e) { console.log("Index unique_profile_file already exists or error creating it."); }
+    try { await dbQuery("CREATE UNIQUE INDEX IF NOT EXISTS unique_profile_file ON documents(userId, name)"); } catch (_e) { /* ignore */ }
 
     // Support Cards Table
-    await db.execute(`CREATE TABLE IF NOT EXISTS support_cards (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS support_cards (
       id TEXT PRIMARY KEY,
       userId TEXT,
       condition TEXT,
@@ -344,7 +387,7 @@ async function createTables() {
     )`);
 
     // Medicines Table
-    await db.execute(`CREATE TABLE IF NOT EXISTS medicines (
+    await dbQuery(`CREATE TABLE IF NOT EXISTS medicines (
       id TEXT PRIMARY KEY,
       userId TEXT,
       name TEXT,
@@ -355,15 +398,13 @@ async function createTables() {
       lastIssuedDate TEXT,
       FOREIGN KEY(userId) REFERENCES users(id)
     )`);
-    try { await db.execute("ALTER TABLE medicines ADD COLUMN lastIssuedDate TEXT"); } catch (_e) { console.log("Column lastIssuedDate already exists or error adding it."); }
+    try { await dbQuery("ALTER TABLE medicines ADD COLUMN lastIssuedDate TEXT"); } catch (_e) { /* ignore */ }
 
     // Task 4: Handshake & Observability - Startup Log
     const logId = 'startup_' + Date.now();
-    const mode = isDev ? 'Local' : 'Cloud';
-    await db.execute({
-      sql: "INSERT INTO activity_logs (id, action_type, description, timestamp) VALUES (?, ?, ?, ?)",
-      args: [logId, 'SYSTEM', `Database initialized: ${mode} mode active.`, new Date().toISOString()]
-    });
+    const mode = usePostgres ? 'Cloud' : 'Local';
+    await dbQuery("INSERT INTO activity_logs (id, action_type, description, timestamp) VALUES ($1, $2, $3, $4)", 
+      [logId, 'SYSTEM', `Database initialized: ${mode} mode active.`, new Date().toISOString()]);
 
   } catch (err) {
     console.error("Failed to create tables:", err);
@@ -390,10 +431,7 @@ watcher.on('add', async (filePath) => {
 
     try {
       // Find user ID by name
-      const { rows } = await db.execute({
-        sql: "SELECT id FROM users WHERE name = ?",
-        args: [userName]
-      });
+      const { rows } = await dbQuery("SELECT id FROM users WHERE name = $1", [userName]);
       const user = rows[0];
       if (!user) return;
 
@@ -404,11 +442,8 @@ watcher.on('add', async (filePath) => {
 
       // Read file data as base64
       const fileData = fs.readFileSync(filePath).toString('base64');
-      const sql = `INSERT INTO documents (id, userId, name, type, mimeType, data, createdAt, status, filePath) VALUES (?,?,?,?,?,?,?,?,?)`;
-      await db.execute({
-        sql,
-        args: [docId, user.id, fileName, type, mimeType, fileData, new Date().toISOString(), 'pending_analysis', filePath]
-      });
+      const sql = `INSERT INTO documents (id, userId, name, type, mimeType, data, createdAt, status, filePath) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`;
+      await dbQuery(sql, [docId, user.id, fileName, type, mimeType, fileData, new Date().toISOString(), 'pending_analysis', filePath]);
     } catch (err) {
       console.error("Failed to process auto-detected file:", err);
     }
@@ -439,7 +474,7 @@ async function checkRemindersAndNotify() {
   `;
 
   try {
-    const { rows } = await db.execute(sql);
+    const { rows } = await dbQuery(sql);
     if (!rows) return;
 
     for (const row of rows) {
@@ -480,18 +515,15 @@ async function checkRemindersAndNotify() {
         console.log("------------------------------------------------");
 
         // Update DB to prevent duplicate sends
-        let updateSql = `UPDATE reminders SET ${triggerUpdateField} = 1, lastNotificationSent = ? WHERE id = ?`;
+        let updateSql = `UPDATE reminders SET ${triggerUpdateField} = 1, lastNotificationSent = $1 WHERE id = $2`;
         
         if (triggerUpdateField === 'sentDayOf') {
-            updateSql = `UPDATE reminders SET sentDayOf = 1, sent1Day = 1, sent4Day = 1, lastNotificationSent = ? WHERE id = ?`;
+            updateSql = `UPDATE reminders SET sentDayOf = 1, sent1Day = 1, sent4Day = 1, lastNotificationSent = $1 WHERE id = $2`;
         }
 
         const newTime = new Date().toISOString();
         
-        await db.execute({
-          sql: updateSql,
-          args: [newTime, row.id]
-        });
+        await dbQuery(updateSql, [newTime, row.id]);
       }
     }
   } catch (err) {
@@ -511,10 +543,7 @@ const checkProfileOwnership = async (req, res, next) => {
   }
 
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT id FROM users WHERE id = ? AND clerkUserId = ?",
-      args: [userId, clerkUserId]
-    });
+    const { rows } = await dbQuery("SELECT id FROM users WHERE id = $1 AND clerkUserId = $2", [userId, clerkUserId]);
     const user = rows[0];
     if (!user) return res.status(403).json({ error: "Forbidden: You do not have access to this profile's data" });
     next();
@@ -529,13 +558,10 @@ const verifyItemOwnership = async (tableName, itemId, clerkUserId) => {
     SELECT i.id 
     FROM ${tableName} i
     JOIN users u ON i.userId = u.id
-    WHERE i.id = ? AND u.clerkUserId = ?
+    WHERE i.id = $1 AND u.clerkUserId = $2
   `;
   try {
-    const { rows } = await db.execute({
-      sql,
-      args: [itemId, clerkUserId]
-    });
+    const { rows } = await dbQuery(sql, [itemId, clerkUserId]);
     return rows.length > 0;
   } catch (err) {
     console.error(`Ownership verification failed for ${tableName}:`, err);
@@ -546,10 +572,7 @@ const verifyItemOwnership = async (tableName, itemId, clerkUserId) => {
 // --- Support Cards ---
 app.get('/api/support-cards/:userId', requireAuth(), checkProfileOwnership, async (req, res) => {
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT * FROM support_cards WHERE userId = ?",
-      args: [req.params.userId]
-    });
+    const { rows } = await dbQuery("SELECT * FROM support_cards WHERE userId = $1", [req.params.userId]);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -558,12 +581,9 @@ app.get('/api/support-cards/:userId', requireAuth(), checkProfileOwnership, asyn
 
 app.post('/api/support-cards', requireAuth(), checkProfileOwnership, async (req, res) => {
   const c = req.body;
-  const sql = `INSERT INTO support_cards (id, userId, condition, nhsUrl, charityUrl, category) VALUES (?,?,?,?,?,?)`;
+  const sql = `INSERT INTO support_cards (id, userId, condition, nhsUrl, charityUrl, category) VALUES ($1,$2,$3,$4,$5,$6)`;
   try {
-    await db.execute({
-      sql,
-      args: [c.id, c.userId, c.condition, c.nhsUrl, c.charityUrl, c.category]
-    });
+    await dbQuery(sql, [c.id, c.userId, c.condition, c.nhsUrl, c.charityUrl, c.category]);
     res.json(c);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -575,10 +595,7 @@ app.delete('/api/support-cards/:id', requireAuth(), async (req, res) => {
     const isOwner = await verifyItemOwnership('support_cards', req.params.id, req.auth.userId);
     if (!isOwner) return res.status(403).json({ error: "Forbidden" });
 
-    await db.execute({
-      sql: "DELETE FROM support_cards WHERE id = ?",
-      args: [req.params.id]
-    });
+    await dbQuery("DELETE FROM support_cards WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -588,10 +605,7 @@ app.delete('/api/support-cards/:id', requireAuth(), async (req, res) => {
 // --- Activity Logs ---
 app.get('/api/activity-logs/:userId', requireAuth(), checkProfileOwnership, async (req, res) => {
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT * FROM activity_logs WHERE userId = ? ORDER BY timestamp DESC",
-      args: [req.params.userId]
-    });
+    const { rows } = await dbQuery("SELECT * FROM activity_logs WHERE userId = $1 ORDER BY timestamp DESC", [req.params.userId]);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -600,12 +614,9 @@ app.get('/api/activity-logs/:userId', requireAuth(), checkProfileOwnership, asyn
 
 app.post('/api/activity-logs', requireAuth(), checkProfileOwnership, async (req, res) => {
   const l = req.body;
-  const sql = `INSERT INTO activity_logs (id, userId, action_type, subject_profile, performed_by, description, timestamp, reference_id, deleted_data) VALUES (?,?,?,?,?,?,?,?,?)`;
+  const sql = `INSERT INTO activity_logs (id, userId, action_type, subject_profile, performed_by, description, timestamp, reference_id, deleted_data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`;
   try {
-    await db.execute({
-      sql,
-      args: [l.id, l.userId, l.action_type, l.subject_profile, l.performed_by, l.description, l.timestamp, l.reference_id, l.deleted_data || null]
-    });
+    await dbQuery(sql, [l.id, l.userId, l.action_type, l.subject_profile, l.performed_by, l.description, l.timestamp, l.reference_id, l.deleted_data || null]);
     res.json(l);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -622,10 +633,7 @@ app.post('/api/restore-item', requireAuth(), async (req, res) => {
     const isOwner = await verifyItemOwnership('activity_logs', logId, clerkUserId);
     if (!isOwner) return res.status(403).json({ error: "Forbidden" });
 
-    const { rows } = await db.execute({
-      sql: "SELECT * FROM activity_logs WHERE id = ?",
-      args: [logId]
-    });
+    const { rows } = await dbQuery("SELECT * FROM activity_logs WHERE id = $1", [logId]);
     const log = rows[0];
     if (!log) return res.status(404).json({ error: "Log not found" });
     if (log.action_type !== 'DELETE' || !log.deleted_data) {
@@ -646,12 +654,12 @@ app.post('/api/restore-item', requireAuth(), async (req, res) => {
 
     if (log.description.startsWith("Deleted reminder:")) {
       tableName = "reminders";
-      sql = `INSERT INTO reminders (id, userId, title, time, date, type, completed, notes, recurrence, notificationCount, lastNotificationSent, sent4Day, sent1Day, sentDayOf) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
+      sql = `INSERT INTO reminders (id, userId, title, time, date, type, completed, notes, recurrence, notificationCount, lastNotificationSent, sent4Day, sent1Day, sentDayOf) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`;
       params = [itemData.id, itemData.userId, itemData.title, itemData.time, itemData.date, itemData.type, itemData.completed ? 1 : 0, itemData.notes || null, itemData.recurrence || 'none', itemData.notificationCount || 0, itemData.lastNotificationSent || null, itemData.sent4Day || 0, itemData.sent1Day || 0, itemData.sentDayOf || 0];
     } else if (log.description.startsWith("Deleted medicine:")) {
       tableName = "medicines";
       const imageJson = itemData.images && itemData.images.length > 0 ? JSON.stringify(itemData.images) : null;
-      sql = `INSERT INTO medicines (id, userId, name, strength, directions, image, createdAt, lastIssuedDate) VALUES (?,?,?,?,?,?,?,?)`;
+      sql = `INSERT INTO medicines (id, userId, name, strength, directions, image, createdAt, lastIssuedDate) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`;
       params = [itemData.id, itemData.userId, itemData.name, itemData.strength || null, itemData.directions || null, imageJson, itemData.createdAt, itemData.lastIssuedDate || null];
     } else if (log.description.startsWith("Deleted document:")) {
       tableName = "documents";
@@ -659,7 +667,7 @@ app.post('/api/restore-item', requireAuth(), async (req, res) => {
         id, userId, name, type, mimeType, data, summary, createdAt,
         category, organization, department, contactName, contactPhone, 
         contactEmail, appointmentDate, appointmentTime, location, status, filePath
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`;
       params = [
         itemData.id, itemData.userId, itemData.name, itemData.type, itemData.mimeType, itemData.data, itemData.summary || null, itemData.createdAt,
         itemData.category || null, itemData.organization || null, itemData.department || null, itemData.contactName || null,
@@ -670,15 +678,12 @@ app.post('/api/restore-item', requireAuth(), async (req, res) => {
       return res.status(400).json({ error: "Unsupported item type for restore" });
     }
 
-    await db.execute({ sql, args: params });
+    await dbQuery(sql, params);
     
     // Log the restore action
-    const restoreLogSql = `INSERT INTO activity_logs (id, userId, action_type, subject_profile, performed_by, description, timestamp, reference_id) VALUES (?,?,?,?,?,?,?,?)`;
+    const restoreLogSql = `INSERT INTO activity_logs (id, userId, action_type, subject_profile, performed_by, description, timestamp, reference_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`;
     const restoreLogId = 'auto_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-    await db.execute({
-      sql: restoreLogSql,
-      args: [restoreLogId, log.userId, 'ADD', log.subject_profile, log.performed_by, `Restored ${tableName.slice(0, -1)}: ${itemData.title || itemData.name}`, new Date().toISOString(), itemData.id]
-    });
+    await dbQuery(restoreLogSql, [restoreLogId, log.userId, 'ADD', log.subject_profile, log.performed_by, `Restored ${tableName.slice(0, -1)}: ${itemData.title || itemData.name}`, new Date().toISOString(), itemData.id]);
 
     res.json({ success: true, message: `Restored ${tableName.slice(0, -1)} successfully.` });
   } catch (err) {
@@ -726,10 +731,7 @@ app.post('/api/admin/restore', async (req, res) => {
 app.get('/api/users', requireAuth(), async (req, res) => {
   const clerkUserId = req.auth.userId;
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT * FROM users WHERE clerkUserId = ?",
-      args: [clerkUserId]
-    });
+    const { rows } = await dbQuery("SELECT * FROM users WHERE clerkUserId = $1", [clerkUserId]);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -740,43 +742,128 @@ app.get('/api/users', requireAuth(), async (req, res) => {
 app.post('/api/users', requireAuth(), async (req, res) => {
   const u = req.body;
   const clerkUserId = req.auth.userId;
-  const sql = `INSERT INTO users (
-    id, clerkUserId, name, avatarColor, createdAt, firstName, surname, address, dateOfBirth, 
-    nhsNumber, telephone, mobile, email, nokName, nokAddress, nokContact, 
-    doctorName, doctorAddress, doctorContact, pharmacyName, pharmacyAddress, pharmacyContact,
-    notificationFrequency, notificationLimit
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
   
-  const params = [
-    u.id, clerkUserId, u.name, u.avatarColor, u.createdAt, u.firstName || null, u.surname || null, 
-    u.address || null, u.dateOfBirth || null, u.nhsNumber || null, u.telephone || null, 
-    u.mobile || null, u.email || null, u.nokName || null, u.nokAddress || null, 
-    u.nokContact || null, u.doctorName || null, u.doctorAddress || null, 
-    u.doctorContact || null, u.pharmacyName || null, u.pharmacyAddress || null, 
-    u.pharmacyContact || null,
-    u.notificationFrequency || 'hourly',
-    u.notificationLimit || 3
-  ];
-  
-  try {
-    await db.execute({ sql, args: params });
+  if (usePostgres) {
+    const sql = `INSERT INTO users (
+      id, clerkUserId, name, avatarColor, createdAt, firstName, surname, address, dateOfBirth, 
+      nhsNumber, telephone, mobile, email, nokName, nokAddress, nokContact, 
+      doctorName, doctorAddress, doctorContact, pharmacyName, pharmacyAddress, pharmacyContact,
+      notificationFrequency, notificationLimit
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+    ON CONFLICT (clerkUserId) DO UPDATE SET
+      name = EXCLUDED.name,
+      avatarColor = EXCLUDED.avatarColor,
+      firstName = EXCLUDED.firstName,
+      surname = EXCLUDED.surname,
+      address = EXCLUDED.address,
+      dateOfBirth = EXCLUDED.dateOfBirth,
+      nhsNumber = EXCLUDED.nhsNumber,
+      telephone = EXCLUDED.telephone,
+      mobile = EXCLUDED.mobile,
+      email = EXCLUDED.email,
+      nokName = EXCLUDED.nokName,
+      nokAddress = EXCLUDED.nokAddress,
+      nokContact = EXCLUDED.nokContact,
+      doctorName = EXCLUDED.doctorName,
+      doctorAddress = EXCLUDED.doctorAddress,
+      doctorContact = EXCLUDED.doctorContact,
+      pharmacyName = EXCLUDED.pharmacyName,
+      pharmacyAddress = EXCLUDED.pharmacyAddress,
+      pharmacyContact = EXCLUDED.pharmacyContact,
+      notificationFrequency = EXCLUDED.notificationFrequency,
+      notificationLimit = EXCLUDED.notificationLimit
+    RETURNING *`;
+    
+    const params = [
+      u.id, clerkUserId, u.name, u.avatarColor, u.createdAt, u.firstName || null, u.surname || null, 
+      u.address || null, u.dateOfBirth || null, u.nhsNumber || null, u.telephone || null, 
+      u.mobile || null, u.email || null, u.nokName || null, u.nokAddress || null, 
+      u.nokContact || null, u.doctorName || null, u.doctorAddress || null, 
+      u.doctorContact || null, u.pharmacyName || null, u.pharmacyAddress || null, 
+      u.pharmacyContact || null,
+      u.notificationFrequency || 'hourly',
+      u.notificationLimit || 3
+    ];
 
-    // Create directory structure
-    const userDir = path.join(USERS_BASE_DIR, u.name);
-    const folders = ['Uploaded', 'Analysed', 'Images', 'Documents'];
-
-    if (!fs.existsSync(userDir)) {
-      fs.mkdirSync(userDir, { recursive: true });
-      folders.forEach(f => {
-        if (!fs.existsSync(path.join(userDir, f))) {
-          fs.mkdirSync(path.join(userDir, f), { recursive: true });
-        }
-      });
+    try {
+      const { rows } = await dbQuery(sql, params);
+      
+      // Create directory structure
+      const userDir = path.join(USERS_BASE_DIR, u.name);
+      const folders = ['Uploaded', 'Analysed', 'Images', 'Documents'];
+      if (!fs.existsSync(userDir)) {
+        fs.mkdirSync(userDir, { recursive: true });
+        folders.forEach(f => {
+          if (!fs.existsSync(path.join(userDir, f))) {
+            fs.mkdirSync(path.join(userDir, f), { recursive: true });
+          }
+        });
+      }
+      res.json(rows[0]);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
+  } else {
+    // SQLite fallback
+    const sql = `INSERT INTO users (
+      id, clerkUserId, name, avatarColor, createdAt, firstName, surname, address, dateOfBirth, 
+      nhsNumber, telephone, mobile, email, nokName, nokAddress, nokContact, 
+      doctorName, doctorAddress, doctorContact, pharmacyName, pharmacyAddress, pharmacyContact,
+      notificationFrequency, notificationLimit
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`;
+    
+    const params = [
+      u.id, clerkUserId, u.name, u.avatarColor, u.createdAt, u.firstName || null, u.surname || null, 
+      u.address || null, u.dateOfBirth || null, u.nhsNumber || null, u.telephone || null, 
+      u.mobile || null, u.email || null, u.nokName || null, u.nokAddress || null, 
+      u.nokContact || null, u.doctorName || null, u.doctorAddress || null, 
+      u.doctorContact || null, u.pharmacyName || null, u.pharmacyAddress || null, 
+      u.pharmacyContact || null,
+      u.notificationFrequency || 'hourly',
+      u.notificationLimit || 3
+    ];
 
-    res.json(u);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    try {
+      // Check if exists for SQLite
+      const { rows: existing } = await dbQuery("SELECT id FROM users WHERE clerkUserId = $1", [clerkUserId]);
+      if (existing.length > 0) {
+        const updateSql = `UPDATE users SET 
+          name=$1, avatarColor=$2, firstName=$3, surname=$4, address=$5, dateOfBirth=$6, nhsNumber=$7, 
+          telephone=$8, mobile=$9, email=$10, nokName=$11, nokAddress=$12, nokContact=$13, 
+          doctorName=$14, doctorAddress=$15, doctorContact=$16, pharmacyName=$17, pharmacyAddress=$18, pharmacyContact=$19,
+          notificationFrequency=$20, notificationLimit=$21
+          WHERE clerkUserId=$22`;
+        const updateParams = [
+          u.name, u.avatarColor, u.firstName || null, u.surname || null, u.address || null, 
+          u.dateOfBirth || null, u.nhsNumber || null, u.telephone || null, 
+          u.mobile || null, u.email || null, u.nokName || null, u.nokAddress || null, 
+          u.nokContact || null, u.doctorName || null, u.doctorAddress || null, 
+          u.doctorContact || null, u.pharmacyName || null, u.pharmacyAddress || null, 
+          u.pharmacyContact || null,
+          u.notificationFrequency || 'hourly',
+          u.notificationLimit || 3,
+          clerkUserId
+        ];
+        await dbQuery(updateSql, updateParams);
+      } else {
+        await dbQuery(sql, params);
+      }
+
+      // Create directory structure
+      const userDir = path.join(USERS_BASE_DIR, u.name);
+      const folders = ['Uploaded', 'Analysed', 'Images', 'Documents'];
+      if (!fs.existsSync(userDir)) {
+        fs.mkdirSync(userDir, { recursive: true });
+        folders.forEach(f => {
+          if (!fs.existsSync(path.join(userDir, f))) {
+            fs.mkdirSync(path.join(userDir, f), { recursive: true });
+          }
+        });
+      }
+      res.json(u);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
@@ -786,11 +873,11 @@ app.put('/api/users/:id', requireAuth(), async (req, res) => {
   const clerkUserId = req.auth.userId;
   
   const sql = `UPDATE users SET 
-    name=?, firstName=?, surname=?, address=?, dateOfBirth=?, nhsNumber=?, 
-    telephone=?, mobile=?, email=?, nokName=?, nokAddress=?, nokContact=?, 
-    doctorName=?, doctorAddress=?, doctorContact=?, pharmacyName=?, pharmacyAddress=?, pharmacyContact=?,
-    notificationFrequency=?, notificationLimit=?
-    WHERE id=? AND clerkUserId=?`;
+    name=$1, firstName=$2, surname=$3, address=$4, dateOfBirth=$5, nhsNumber=$6, 
+    telephone=$7, mobile=$8, email=$9, nokName=$10, nokAddress=$11, nokContact=$12, 
+    doctorName=$13, doctorAddress=$14, doctorContact=$15, pharmacyName=$16, pharmacyAddress=$17, pharmacyContact=$18,
+    notificationFrequency=$19, notificationLimit=$20
+    WHERE id=$21 AND clerkUserId=$22`;
     
   const params = [
     u.name, u.firstName || null, u.surname || null, u.address || null, 
@@ -806,7 +893,7 @@ app.put('/api/users/:id', requireAuth(), async (req, res) => {
   ];
 
   try {
-    const result = await db.execute({ sql, args: params });
+    const result = await dbQuery(sql, params);
     if (result.rowsAffected === 0) {
       return res.status(403).json({ error: "Unauthorized: You do not own this profile or it does not exist." });
     }
@@ -822,25 +909,22 @@ app.delete('/api/users/:id', requireAuth(), async (req, res) => {
   const clerkUserId = req.auth.userId;
 
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT name FROM users WHERE id = ? AND clerkUserId = ?",
-      args: [userId, clerkUserId]
-    });
+    const { rows } = await dbQuery("SELECT name FROM users WHERE id = $1 AND clerkUserId = $2", [userId, clerkUserId]);
     const user = rows[0];
     if (!user) return res.status(404).json({ error: "User not found or not authorized" });
 
     const userName = user.name;
 
     // Delete related records
-    await db.execute({ sql: "DELETE FROM reminders WHERE userId = ?", args: [userId] });
-    await db.execute({ sql: "DELETE FROM medicines WHERE userId = ?", args: [userId] });
-    await db.execute({ sql: "DELETE FROM documents WHERE userId = ?", args: [userId] });
-    await db.execute({ sql: "DELETE FROM caregivers WHERE userId = ?", args: [userId] });
-    await db.execute({ sql: "DELETE FROM support_cards WHERE userId = ?", args: [userId] });
-    await db.execute({ sql: "DELETE FROM activity_logs WHERE userId = ?", args: [userId] });
+    await dbQuery("DELETE FROM reminders WHERE userId = $1", [userId]);
+    await dbQuery("DELETE FROM medicines WHERE userId = $1", [userId]);
+    await dbQuery("DELETE FROM documents WHERE userId = $1", [userId]);
+    await dbQuery("DELETE FROM caregivers WHERE userId = $1", [userId]);
+    await dbQuery("DELETE FROM support_cards WHERE userId = $1", [userId]);
+    await dbQuery("DELETE FROM activity_logs WHERE userId = $1", [userId]);
     
     // Finally, delete the user
-    await db.execute({ sql: "DELETE FROM users WHERE id = ?", args: [userId] });
+    await dbQuery("DELETE FROM users WHERE id = $1", [userId]);
 
     // Delete the user's folder
     const userDir = path.join(USERS_BASE_DIR, userName);
@@ -857,10 +941,7 @@ app.delete('/api/users/:id', requireAuth(), async (req, res) => {
 // Get Reminders
 app.get('/api/reminders/:userId', requireAuth(), checkProfileOwnership, async (req, res) => {
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT * FROM reminders WHERE userId = ?",
-      args: [req.params.userId]
-    });
+    const { rows } = await dbQuery("SELECT * FROM reminders WHERE userId = $1", [req.params.userId]);
     const reminders = rows.map(r => ({ ...r, completed: !!r.completed }));
     res.json(reminders);
   } catch (err) {
@@ -872,11 +953,11 @@ app.get('/api/reminders/:userId', requireAuth(), checkProfileOwnership, async (r
 app.post('/api/reminders', requireAuth(), checkProfileOwnership, async (req, res) => {
   const r = req.body;
   const recurrence = r.recurrence || 'none';
-  const sql = `INSERT INTO reminders (id, userId, title, time, date, type, completed, notes, recurrence, notificationCount, lastNotificationSent, sent4Day, sent1Day, sentDayOf) VALUES (?,?,?,?,?,?,?,?,?,0,null,0,0,0)`;
+  const sql = `INSERT INTO reminders (id, userId, title, time, date, type, completed, notes, recurrence, notificationCount, lastNotificationSent, sent4Day, sent1Day, sentDayOf) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,null,0,0,0)`;
   const params = [r.id, r.userId, r.title, r.time, r.date, r.type, r.completed ? 1 : 0, r.notes || null, recurrence];
 
   try {
-    await db.execute({ sql, args: params });
+    await dbQuery(sql, params);
     res.json(r);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -893,21 +974,15 @@ app.put('/api/reminders/:id', requireAuth(), async (req, res) => {
     
     if (typeof completed !== 'undefined') {
         const sql = completed 
-          ? "UPDATE reminders SET completed = ? WHERE id = ?"
-          : "UPDATE reminders SET completed = ?, notificationCount = 0, lastNotificationSent = NULL WHERE id = ?";
+          ? "UPDATE reminders SET completed = $1 WHERE id = $2"
+          : "UPDATE reminders SET completed = $1, notificationCount = 0, lastNotificationSent = NULL WHERE id = $2";
           
-        await db.execute({
-          sql,
-          args: [completed ? 1 : 0, req.params.id]
-        });
+        await dbQuery(sql, [completed ? 1 : 0, req.params.id]);
         res.json({ success: true });
     } else {
         const { title, time, date, type, notes, recurrence } = req.body;
-        const sql = `UPDATE reminders SET title = ?, time = ?, date = ?, type = ?, notes = ?, recurrence = ? WHERE id = ?`;
-        await db.execute({
-          sql,
-          args: [title, time, date, type, notes, recurrence, req.params.id]
-        });
+        const sql = `UPDATE reminders SET title = $1, time = $2, date = $3, type = $4, notes = $5, recurrence = $6 WHERE id = $7`;
+        await dbQuery(sql, [title, time, date, type, notes, recurrence, req.params.id]);
         res.json({ success: true });
     }
   } catch (err) {
@@ -921,10 +996,7 @@ app.delete('/api/reminders/:id', requireAuth(), async (req, res) => {
     const isOwner = await verifyItemOwnership('reminders', req.params.id, req.auth.userId);
     if (!isOwner) return res.status(403).json({ error: "Forbidden" });
 
-    await db.execute({
-      sql: "DELETE FROM reminders WHERE id = ?",
-      args: [req.params.id]
-    });
+    await dbQuery("DELETE FROM reminders WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -934,10 +1006,7 @@ app.delete('/api/reminders/:id', requireAuth(), async (req, res) => {
 // Document/Medicine Endpoints
 app.get('/api/documents/:userId', requireAuth(), checkProfileOwnership, async (req, res) => {
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT * FROM documents WHERE userId = ? ORDER BY createdAt DESC",
-      args: [req.params.userId]
-    });
+    const { rows } = await dbQuery("SELECT * FROM documents WHERE userId = $1 ORDER BY createdAt DESC", [req.params.userId]);
     const formattedRows = rows.map(row => {
       if (row.file_blob) {
         row.file_blob = Buffer.from(row.file_blob).toString('base64');
@@ -955,10 +1024,7 @@ app.post('/api/documents', requireAuth(), checkProfileOwnership, async (req, res
   
   try {
     // Check for duplicate filename
-    const { rows } = await db.execute({
-      sql: "SELECT id FROM documents WHERE userId = ? AND name = ?",
-      args: [d.userId, d.name]
-    });
+    const { rows } = await dbQuery("SELECT id FROM documents WHERE userId = $1 AND name = $2", [d.userId, d.name]);
     if (rows.length > 0) {
       return res.status(409).json({ error: `A file named '${d.name}' already exists. Please rename the new file to continue.` });
     }
@@ -968,7 +1034,7 @@ app.post('/api/documents', requireAuth(), checkProfileOwnership, async (req, res
       id, userId, name, type, mimeType, data, summary, createdAt,
       category, organization, department, contactName, contactPhone, 
       contactEmail, appointmentDate, appointmentTime, location, file_blob
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`;
     
     const params = [
       d.id, d.userId, d.name, d.type, d.mimeType, d.data, d.summary || null, d.createdAt,
@@ -977,7 +1043,7 @@ app.post('/api/documents', requireAuth(), checkProfileOwnership, async (req, res
       d.appointmentTime || null, d.location || null, fileBlob
     ];
 
-    await db.execute({ sql, args: params });
+    await dbQuery(sql, params);
     res.json(d);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -992,10 +1058,7 @@ app.put('/api/documents/:id', requireAuth(), async (req, res) => {
     const d = req.body;
     const docId = req.params.id;
 
-    const { rows } = await db.execute({
-      sql: "SELECT status, filePath, userId FROM documents WHERE id = ?",
-      args: [docId]
-    });
+    const { rows } = await dbQuery("SELECT status, filePath, userId FROM documents WHERE id = $1", [docId]);
     const currentDoc = rows[0];
     if (!currentDoc) return res.status(404).json({ error: "Document not found" });
 
@@ -1024,11 +1087,11 @@ app.put('/api/documents/:id', requireAuth(), async (req, res) => {
     }
 
     const sql = `UPDATE documents SET 
-      summary = ?, category = ?, organization = ?, department = ?, 
-      contactName = ?, contactPhone = ?, contactEmail = ?, 
-      appointmentDate = ?, appointmentTime = ?, location = ?, 
-      status = ?, filePath = ?
-      WHERE id = ?`;
+      summary = $1, category = $2, organization = $3, department = $4, 
+      contactName = $5, contactPhone = $6, contactEmail = $7, 
+      appointmentDate = $8, appointmentTime = $9, location = $10, 
+      status = $11, filePath = $12
+      WHERE id = $13`;
     
     const params = [
       d.summary || null, d.category || null, d.organization || null, d.department || null,
@@ -1037,7 +1100,7 @@ app.put('/api/documents/:id', requireAuth(), async (req, res) => {
       d.status || currentDoc.status, newFilePath, docId
     ];
 
-    await db.execute({ sql, args: params });
+    await dbQuery(sql, params);
     res.json({ success: true, filePath: newFilePath });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1050,10 +1113,7 @@ app.delete('/api/documents/:id', requireAuth(), async (req, res) => {
     if (!isOwner) return res.status(403).json({ error: "Forbidden" });
 
     const docId = req.params.id;
-    const { rows } = await db.execute({
-      sql: "SELECT filePath FROM documents WHERE id = ?",
-      args: [docId]
-    });
+    const { rows } = await dbQuery("SELECT filePath FROM documents WHERE id = $1", [docId]);
     const row = rows[0];
     if (row && row.filePath && fs.existsSync(row.filePath)) {
       try {
@@ -1063,10 +1123,7 @@ app.delete('/api/documents/:id', requireAuth(), async (req, res) => {
         console.error("Failed to delete physical file:", err);
       }
     }
-    await db.execute({
-      sql: "DELETE FROM documents WHERE id = ?",
-      args: [docId]
-    });
+    await dbQuery("DELETE FROM documents WHERE id = $1", [docId]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1075,10 +1132,7 @@ app.delete('/api/documents/:id', requireAuth(), async (req, res) => {
 
 app.get('/api/medicines/:userId', requireAuth(), checkProfileOwnership, async (req, res) => {
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT * FROM medicines WHERE userId = ? ORDER BY createdAt DESC",
-      args: [req.params.userId]
-    });
+    const { rows } = await dbQuery("SELECT * FROM medicines WHERE userId = $1 ORDER BY createdAt DESC", [req.params.userId]);
     const medicines = rows.map(row => {
       let images = [];
       if (row.image) {
@@ -1100,12 +1154,9 @@ app.get('/api/medicines/:userId', requireAuth(), checkProfileOwnership, async (r
 app.post('/api/medicines', requireAuth(), checkProfileOwnership, async (req, res) => {
   const m = req.body;
   const imageJson = m.images && m.images.length > 0 ? JSON.stringify(m.images) : null;
-  const sql = `INSERT INTO medicines (id, userId, name, strength, directions, image, createdAt, lastIssuedDate) VALUES (?,?,?,?,?,?,?,?)`;
+  const sql = `INSERT INTO medicines (id, userId, name, strength, directions, image, createdAt, lastIssuedDate) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`;
   try {
-    await db.execute({
-      sql,
-      args: [m.id, m.userId, m.name, m.strength || null, m.directions || null, imageJson, m.createdAt, m.lastIssuedDate || null]
-    });
+    await dbQuery(sql, [m.id, m.userId, m.name, m.strength || null, m.directions || null, imageJson, m.createdAt, m.lastIssuedDate || null]);
     res.json(m);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1119,11 +1170,8 @@ app.put('/api/medicines/:id', requireAuth(), async (req, res) => {
 
     const m = req.body;
     const imageJson = m.images && m.images.length > 0 ? JSON.stringify(m.images) : null;
-    const sql = `UPDATE medicines SET name=?, strength=?, directions=?, image=?, lastIssuedDate=? WHERE id=?`;
-    await db.execute({
-      sql,
-      args: [m.name, m.strength || null, m.directions || null, imageJson, m.lastIssuedDate || null, req.params.id]
-    });
+    const sql = `UPDATE medicines SET name=$1, strength=$2, directions=$3, image=$4, lastIssuedDate=$5 WHERE id=$6`;
+    await dbQuery(sql, [m.name, m.strength || null, m.directions || null, imageJson, m.lastIssuedDate || null, req.params.id]);
     res.json(m);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1135,10 +1183,7 @@ app.delete('/api/medicines/:id', requireAuth(), async (req, res) => {
     const isOwner = await verifyItemOwnership('medicines', req.params.id, req.auth.userId);
     if (!isOwner) return res.status(403).json({ error: "Forbidden" });
 
-    await db.execute({
-      sql: "DELETE FROM medicines WHERE id = ?",
-      args: [req.params.id]
-    });
+    await dbQuery("DELETE FROM medicines WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1150,10 +1195,10 @@ const logActivity = async (profileId, eventType, message, status, technicalDetai
   const id = Math.random().toString(36).substring(2, 15);
   const timestamp = new Date().toISOString();
   try {
-    await db.execute({
-      sql: "INSERT INTO system_activity_logs (id, profileId, eventType, message, status, technicalDetails, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      args: [id, profileId, eventType, message, status, technicalDetails || null, timestamp]
-    });
+    await dbQuery(
+      "INSERT INTO activity_logs (id, userId, action_type, description, timestamp, reference_id) VALUES ($1, $2, $3, $4, $5, $6)",
+      [id, profileId, eventType, message, timestamp, technicalDetails || null]
+    );
   } catch (err) {
     console.error("Failed to log activity:", err);
   }
@@ -1275,12 +1320,7 @@ app.post('/api/analyze-document', requireAuth(), checkProfileOwnership, async (r
     
     let smsResults = [];
     if (analysis.is_critical && analysis.caregiver_sms) {
-      const caregivers = await new Promise((resolve, reject) => {
-        db.all("SELECT * FROM caregivers WHERE userId = ? AND alertsEnabled = 1", [userId], (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        });
-      });
+      const { rows: caregivers } = await dbQuery("SELECT * FROM caregivers WHERE userId = $1 AND alertsEnabled = 1", [userId]);
       
       for (const caregiver of caregivers) {
         const result = await sendCaregiverSMS(caregiver.phoneNumber, analysis.caregiver_sms, userId, caregiver.name);
@@ -1306,10 +1346,7 @@ app.post('/api/caregiver-alert', requireAuth(), checkProfileOwnership, async (re
   }
 
   try {
-    const { rows: caregivers } = await db.execute({
-      sql: "SELECT * FROM caregivers WHERE userId = ? AND alertsEnabled = 1",
-      args: [userId]
-    });
+    const { rows: caregivers } = await dbQuery("SELECT * FROM caregivers WHERE userId = $1 AND alertsEnabled = 1", [userId]);
 
     if (!caregivers || caregivers.length === 0) {
       console.log(`No active caregivers found for user ${userId}. Skipping SMS alerts.`);
@@ -1318,8 +1355,8 @@ app.post('/api/caregiver-alert', requireAuth(), checkProfileOwnership, async (re
 
     let successCount = 0;
     for (const caregiver of caregivers) {
-      const success = await sendCaregiverSMS(caregiver.phoneNumber, smsSummary);
-      if (success) successCount++;
+      const result = await sendCaregiverSMS(caregiver.phoneNumber, smsSummary, userId, caregiver.name);
+      if (result.success) successCount++;
     }
 
     res.json({ success: true, sentCount: successCount, totalCaregivers: caregivers.length });
@@ -1332,10 +1369,7 @@ app.post('/api/caregiver-alert', requireAuth(), checkProfileOwnership, async (re
 // Caregiver CRUD
 app.get('/api/caregivers/:userId', requireAuth(), checkProfileOwnership, async (req, res) => {
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT * FROM caregivers WHERE userId = ?",
-      args: [req.params.userId]
-    });
+    const { rows } = await dbQuery("SELECT * FROM caregivers WHERE userId = $1", [req.params.userId]);
     res.json(rows || []);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1344,12 +1378,9 @@ app.get('/api/caregivers/:userId', requireAuth(), checkProfileOwnership, async (
 
 app.post('/api/caregivers', requireAuth(), checkProfileOwnership, async (req, res) => {
   const { id, userId, name, phoneNumber, relationship, alertsEnabled } = req.body;
-  const sql = `INSERT INTO caregivers (id, userId, name, phoneNumber, relationship, alertsEnabled) VALUES (?, ?, ?, ?, ?, ?)`;
+  const sql = `INSERT INTO caregivers (id, userId, name, phoneNumber, relationship, alertsEnabled) VALUES ($1, $2, $3, $4, $5, $6)`;
   try {
-    await db.execute({
-      sql,
-      args: [id, userId, name, phoneNumber, relationship, alertsEnabled === false ? 0 : 1]
-    });
+    await dbQuery(sql, [id, userId, name, phoneNumber, relationship, alertsEnabled === false ? 0 : 1]);
     res.json({ success: true });
   } catch (err) {
     console.error(`[POST /api/caregivers] Database Insert Error:`, err.message);
@@ -1363,11 +1394,8 @@ app.put('/api/caregivers/:id', requireAuth(), async (req, res) => {
     if (!isOwner) return res.status(403).json({ error: "Forbidden" });
 
     const { name, phoneNumber, relationship, alertsEnabled } = req.body;
-    const sql = `UPDATE caregivers SET name=?, phoneNumber=?, relationship=?, alertsEnabled=? WHERE id=?`;
-    await db.execute({
-      sql,
-      args: [name, phoneNumber, relationship, alertsEnabled === false ? 0 : 1, req.params.id]
-    });
+    const sql = `UPDATE caregivers SET name=$1, phoneNumber=$2, relationship=$3, alertsEnabled=$4 WHERE id=$5`;
+    await dbQuery(sql, [name, phoneNumber, relationship, alertsEnabled === false ? 0 : 1, req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1379,10 +1407,7 @@ app.delete('/api/caregivers/:id', requireAuth(), async (req, res) => {
     const isOwner = await verifyItemOwnership('caregivers', req.params.id, req.auth.userId);
     if (!isOwner) return res.status(403).json({ error: "Forbidden" });
 
-    await db.execute({
-      sql: "DELETE FROM caregivers WHERE id=?",
-      args: [req.params.id]
-    });
+    await dbQuery("DELETE FROM caregivers WHERE id=$1", [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1393,10 +1418,7 @@ app.delete('/api/caregivers/:id', requireAuth(), async (req, res) => {
 app.get('/api/logs/:profileId', requireAuth(), checkProfileOwnership, async (req, res) => {
   const { profileId } = req.params;
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT * FROM activity_logs WHERE profileId = ? ORDER BY timestamp DESC LIMIT 50",
-      args: [profileId]
-    });
+    const { rows } = await dbQuery("SELECT * FROM activity_logs WHERE userId = $1 ORDER BY timestamp DESC LIMIT 50", [profileId]);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
