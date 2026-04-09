@@ -31,6 +31,7 @@ import { generateId } from './utils/helpers';
 import { playAudio } from './utils/audioUtils';
 import { motion, AnimatePresence } from 'motion/react';
 import { SpeedInsights } from "@vercel/speed-insights/react";
+import { Analytics } from "@vercel/analytics/react";
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
@@ -576,6 +577,7 @@ const App: React.FC = () => {
         )}
       </Show>
       <SpeedInsights />
+      <Analytics />
     </div>
   );
 };
